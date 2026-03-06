@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data files (large)
+data/raw/*.tif
+data/raw/*.las
+data/raw/*.laz
+data/processed/*.tif
+data/processed/*.npy
+*.h5
+*.hdf5
+
+# Model checkpoints
+models/checkpoints/*.pt
+models/checkpoints/*.pth
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+.env
