@@ -306,6 +306,18 @@ def create_tiles(
     return count
 
 
+def derive_centerline(ref_lines: dict[str, list[LineString]]) -> LineString:
+    """Leid een centerline af uit de kruinlijnen (middelpunt binnenkruin/buitenkruin)."""
+    # Gebruik de langste kruinlijn als basis
+    all_kruin = ref_lines.get("binnenkruin", []) + ref_lines.get("buitenkruin", [])
+    if not all_kruin:
+        raise ValueError("Geen kruinlijnen beschikbaar om centerline af te leiden")
+
+    base_line = max(all_kruin, key=lambda l: l.length)
+    print(f"  Centerline afgeleid uit langste kruinlijn ({base_line.length:.0f}m)")
+    return base_line
+
+
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -317,14 +329,10 @@ def main():
     print("\n[1] Laden referentielijnen...")
     ref_lines = load_reference_lines()
 
-    # 2. Laad trajecten
-    with open(TRAJECTEN_FILE) as f:
-        geojson = json.load(f)
-    trajecten = [shape(feat["geometry"]) for feat in geojson["features"]]
-    namen = [
-        feat["properties"].get("gemeente", f"traject_{i}")
-        for i, feat in enumerate(geojson["features"])
-    ]
+    # 2. Leid centerline af uit de kruinlijnen zelf
+    #    (referentielijnen liggen in ander gebied dan Trajecten ZWO)
+    print("\n[2] Centerline afleiden...")
+    centerline = derive_centerline(ref_lines)
 
     # 3. Directories voor tiles
     tiles_dir = OUTPUT_DIR / "tiles" / "dtm"
@@ -340,98 +348,97 @@ def main():
     total_tiles = 0
     section_id = 0
 
-    for traject_idx, (line, naam) in enumerate(zip(trajecten, namen)):
-        print(f"\n--- Traject {traject_idx + 1}: {naam} ({line.length:.0f}m) ---")
+    print(f"\n--- Referentiegebied ({centerline.length:.0f}m) ---")
 
-        start = 500
-        while start + SECTION_LENGTH_M <= line.length - 500:
-            section = extract_section(line, start, SECTION_LENGTH_M)
-            if section is None:
-                start += SECTION_SPACING_M
-                continue
-
-            section_id += 1
-            section_dir = OUTPUT_DIR / "sections" / f"s{section_id:02d}"
-            section_dir.mkdir(parents=True, exist_ok=True)
-
-            bbox = section.buffer(BUFFER_M).bounds
-            dtm_path = section_dir / "dtm.tif"
-            rgb_path = section_dir / "luchtfoto.tif"
-            labels_path = section_dir / "labels.tif"
-
-            print(f"\n  Sectie {section_id}: {naam} {start:.0f}-{start + SECTION_LENGTH_M:.0f}m")
-
-            # Download DTM
-            try:
-                print(f"    DTM downloaden...", end=" ", flush=True)
-                px_w, px_h = download_ahn4_dtm(bbox, dtm_path)
-                print(f"OK ({px_w}x{px_h})")
-            except Exception as e:
-                print(f"FOUT: {e}")
-                start += SECTION_SPACING_M
-                continue
-
-            # Download luchtfoto
-            try:
-                print(f"    Luchtfoto downloaden...", end=" ", flush=True)
-                download_luchtfoto(bbox, rgb_path, px_w, px_h)
-                print("OK")
-            except Exception as e:
-                print(f"FOUT: {e}")
-                rgb_path = None
-
-            # Clip referentielijnen tot deze sectie
-            print(f"    Labels genereren (echte lijnen)...")
-            clipped = {}
-            for ref_name, lines in ref_lines.items():
-                clipped_line = clip_lines_to_bbox(lines, bbox)
-                clipped[ref_name] = clipped_line
-                if clipped_line is not None:
-                    print(f"      {ref_name}: {clipped_line.length:.0f}m")
-                else:
-                    print(f"      {ref_name}: niet beschikbaar")
-
-            # Check of er genoeg lijnen zijn
-            n_available = sum(1 for v in clipped.values() if v is not None)
-            if n_available < 2:
-                print(f"    Te weinig referentielijnen ({n_available}), skip sectie.")
-                start += SECTION_SPACING_M
-                continue
-
-            # Genereer labels
-            try:
-                generate_labels_from_lines(
-                    dtm_path=str(dtm_path),
-                    reference_lines=clipped,
-                    output_labels_path=str(labels_path),
-                    kruin_buffer=2.0,
-                    teen_buffer=2.5,
-                )
-            except Exception as e:
-                print(f"    Labels FOUT: {e}")
-                start += SECTION_SPACING_M
-                continue
-
-            # Knip tiles
-            n = create_tiles(
-                dtm_path, labels_path, rgb_path,
-                tiles_dir, labels_tiles_dir, rgb_tiles_dir,
-                tile_size=TILE_SIZE, overlap=TILE_OVERLAP,
-            )
-
-            # Hernoem met sectie-prefix
-            for d in [tiles_dir, labels_tiles_dir, rgb_tiles_dir]:
-                if not d.exists():
-                    continue
-                for f in sorted(d.glob("tile_*.tif")):
-                    new_name = f"s{section_id:02d}_{f.name}"
-                    if not (d / new_name).exists():
-                        f.rename(d / new_name)
-
-            total_tiles += n
-            print(f"    {n} tiles gegenereerd (totaal: {total_tiles})")
-
+    start = 500
+    while start + SECTION_LENGTH_M <= centerline.length - 500:
+        section = extract_section(centerline, start, SECTION_LENGTH_M)
+        if section is None:
             start += SECTION_SPACING_M
+            continue
+
+        section_id += 1
+        section_dir = OUTPUT_DIR / "sections" / f"s{section_id:02d}"
+        section_dir.mkdir(parents=True, exist_ok=True)
+
+        bbox = section.buffer(BUFFER_M).bounds
+        dtm_path = section_dir / "dtm.tif"
+        rgb_path = section_dir / "luchtfoto.tif"
+        labels_path = section_dir / "labels.tif"
+
+        print(f"\n  Sectie {section_id}: {start:.0f}-{start + SECTION_LENGTH_M:.0f}m")
+
+        # Download DTM
+        try:
+            print(f"    DTM downloaden...", end=" ", flush=True)
+            px_w, px_h = download_ahn4_dtm(bbox, dtm_path)
+            print(f"OK ({px_w}x{px_h})")
+        except Exception as e:
+            print(f"FOUT: {e}")
+            start += SECTION_SPACING_M
+            continue
+
+        # Download luchtfoto
+        try:
+            print(f"    Luchtfoto downloaden...", end=" ", flush=True)
+            download_luchtfoto(bbox, rgb_path, px_w, px_h)
+            print("OK")
+        except Exception as e:
+            print(f"FOUT: {e}")
+            rgb_path = None
+
+        # Clip referentielijnen tot deze sectie
+        print(f"    Labels genereren (echte lijnen)...")
+        clipped = {}
+        for ref_name, lines in ref_lines.items():
+            clipped_line = clip_lines_to_bbox(lines, bbox)
+            clipped[ref_name] = clipped_line
+            if clipped_line is not None:
+                print(f"      {ref_name}: {clipped_line.length:.0f}m")
+            else:
+                print(f"      {ref_name}: niet beschikbaar")
+
+        # Check of er genoeg lijnen zijn
+        n_available = sum(1 for v in clipped.values() if v is not None)
+        if n_available < 2:
+            print(f"    Te weinig referentielijnen ({n_available}), skip sectie.")
+            start += SECTION_SPACING_M
+            continue
+
+        # Genereer labels
+        try:
+            generate_labels_from_lines(
+                dtm_path=str(dtm_path),
+                reference_lines=clipped,
+                output_labels_path=str(labels_path),
+                kruin_buffer=2.0,
+                teen_buffer=2.5,
+            )
+        except Exception as e:
+            print(f"    Labels FOUT: {e}")
+            start += SECTION_SPACING_M
+            continue
+
+        # Knip tiles
+        n = create_tiles(
+            dtm_path, labels_path, rgb_path,
+            tiles_dir, labels_tiles_dir, rgb_tiles_dir,
+            tile_size=TILE_SIZE, overlap=TILE_OVERLAP,
+        )
+
+        # Hernoem met sectie-prefix
+        for d in [tiles_dir, labels_tiles_dir, rgb_tiles_dir]:
+            if not d.exists():
+                continue
+            for f in sorted(d.glob("tile_*.tif")):
+                new_name = f"s{section_id:02d}_{f.name}"
+                if not (d / new_name).exists():
+                    f.rename(d / new_name)
+
+        total_tiles += n
+        print(f"    {n} tiles gegenereerd (totaal: {total_tiles})")
+
+        start += SECTION_SPACING_M
 
     print(f"\n{'=' * 60}")
     print(f"Data-generatie voltooid: {total_tiles} tiles van {section_id} secties")

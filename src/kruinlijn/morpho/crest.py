@@ -110,6 +110,32 @@ def detect_knikpunten(
         Profielen aangevuld met per knikpunt-type:
         - '{type}_idx', '{type}_xy', '{type}_z'
     """
+    # Stap 1: als water_side niet opgegeven, bepaal het GLOBAAL
+    # via meerderheidsstemming over alle profielen. Dit voorkomt dat
+    # de binnen/buiten-toewijzing per profiel wisselt (= kruisende lijnen).
+    if water_side is None:
+        votes_left_is_binnen = 0
+        votes_right_is_binnen = 0
+        margin = 3
+        edge_n = min(5, margin + 1)
+
+        for profile in profiles:
+            z = profile["elevations"]
+            crest_idx = profile.get("crest_idx")
+            if crest_idx is None or np.isfinite(z).sum() < 10:
+                continue
+            z_clean = _interpolate_nans(z.copy())
+            z_smooth = gaussian_filter1d(z_clean, sigma=smooth_sigma)
+            left_edge_z = np.nanmean(z_smooth[:edge_n])
+            right_edge_z = np.nanmean(z_smooth[-edge_n:])
+            if left_edge_z <= right_edge_z:
+                votes_left_is_binnen += 1
+            else:
+                votes_right_is_binnen += 1
+
+        global_left_is_binnen = votes_left_is_binnen >= votes_right_is_binnen
+
+    # Stap 2: detecteer knikpunten per profiel met consistente zijde-toewijzing
     for profile in profiles:
         z = profile["elevations"]
         pts = profile["points"]
@@ -135,8 +161,6 @@ def detect_knikpunten(
         margin = 3  # minimale afstand tot rasterrand
 
         # Detecteer knikpunten op beide zijden van de kruin
-        # Zoek tot aan de kruin (niet crest_idx - margin), zodat kruinranden
-        # vlak bij de kruin ook gevonden worden.
         left_kruinrand, left_teen = _detect_side_knikpunten(
             z_smooth, d2z, margin, crest_idx,
             is_left=True,
@@ -146,27 +170,19 @@ def detect_knikpunten(
             is_left=False,
         )
 
-        # Bepaal welke zijde binnen (polder) en buiten (water) is
-        # Heuristiek: de zijde met lagere randhoogte = binnenzijde (polder)
-        edge_n = min(5, margin + 1)
-        left_edge_z = np.nanmean(z_smooth[:edge_n])
-        right_edge_z = np.nanmean(z_smooth[-edge_n:])
-
         # Detecteer bermen (vlakke stukken op het talud)
         d1z = np.gradient(z_smooth)
         left_berm = _detect_berm(d1z, left_teen, left_kruinrand)
         right_berm = _detect_berm(d1z, right_teen, right_kruinrand)
 
         # Bepaal welke zijde binnen (polder) en buiten (water) is
+        # Gebruik de GLOBALE bepaling zodat alle profielen consistent zijn
         if water_side == "right":
             left_is_binnen = True
         elif water_side == "left":
             left_is_binnen = False
         else:
-            # Heuristiek: lagere randhoogte = binnenzijde (polder)
-            left_edge_z = np.nanmean(z_smooth[:edge_n])
-            right_edge_z = np.nanmean(z_smooth[-edge_n:])
-            left_is_binnen = left_edge_z <= right_edge_z
+            left_is_binnen = global_left_is_binnen
 
         if left_is_binnen:
             binnen_kruinrand, binnen_teen, binnen_berm = left_kruinrand, left_teen, left_berm
@@ -316,10 +332,67 @@ def _assign_knikpunt(
         profile[f"{ktype}_z"] = float(z[idx])
 
 
+def _filter_outliers_and_smooth(coords: np.ndarray, max_deviation: float = 8.0) -> np.ndarray:
+    """Verwijder uitschieters en smooth coördinaten.
+
+    Uitschieters worden gedetecteerd als punten die meer dan max_deviation
+    meter afwijken van het lopende mediaan. Na filtering wordt een Gaussian
+    smooth toegepast voor een vloeiend resultaat.
+
+    Parameters
+    ----------
+    coords : np.ndarray
+        (N, 2) array van XY-coördinaten.
+    max_deviation : float
+        Maximale afwijking in meters t.o.v. het lokale mediaan.
+    """
+    if len(coords) < 5:
+        return coords
+
+    # Stap 1: median filter om referentielijn te bepalen
+    from scipy.ndimage import median_filter, gaussian_filter1d
+
+    window = min(11, len(coords) // 2 * 2 + 1)  # oneven window
+    ref_x = median_filter(coords[:, 0], size=window, mode="nearest")
+    ref_y = median_filter(coords[:, 1], size=window, mode="nearest")
+
+    # Stap 2: afwijking t.o.v. mediaan
+    dx = coords[:, 0] - ref_x
+    dy = coords[:, 1] - ref_y
+    dist = np.sqrt(dx**2 + dy**2)
+
+    # Stap 3: verwijder uitschieters
+    inliers = dist < max_deviation
+    if inliers.sum() < 2:
+        return coords
+
+    # Interpoleer gaps waar uitschieters verwijderd zijn
+    x_clean = np.interp(
+        np.arange(len(coords)),
+        np.where(inliers)[0],
+        coords[inliers, 0],
+    )
+    y_clean = np.interp(
+        np.arange(len(coords)),
+        np.where(inliers)[0],
+        coords[inliers, 1],
+    )
+
+    # Stap 4: Gaussian smoothing
+    sigma = max(3.0, len(coords) / 50)
+    x_smooth = gaussian_filter1d(x_clean, sigma=sigma)
+    y_smooth = gaussian_filter1d(y_clean, sigma=sigma)
+
+    return np.column_stack([x_smooth, y_smooth])
+
+
 def knikpunten_to_lines(
     profiles: list[dict], smooth: bool = True
 ) -> dict[str, LineString | None]:
     """Verbind knikpunten tot kniklijnen per type.
+
+    Filtert uitschieters en past Gaussian smoothing toe om te voorkomen
+    dat lijnen elkaar kruisen.
 
     Returns
     -------
@@ -336,11 +409,7 @@ def knikpunten_to_lines(
 
         coords = np.array(points)
         if smooth and len(coords) > 5:
-            kernel = 5
-            pad = kernel // 2
-            coords_padded = np.pad(coords, ((pad, pad), (0, 0)), mode="edge")
-            for i in range(len(coords)):
-                coords[i] = coords_padded[i : i + kernel].mean(axis=0)
+            coords = _filter_outliers_and_smooth(coords)
 
         lines[ktype] = LineString(coords)
 
@@ -355,7 +424,7 @@ def crest_points_to_line(profiles: list[dict], smooth: bool = True) -> LineStrin
     profiles : list[dict]
         Profielen met 'crest_xy' key.
     smooth : bool
-        Als True, pas een moving average toe om uitschieters te dempen.
+        Als True, filter uitschieters en pas Gaussian smoothing toe.
 
     Returns
     -------
@@ -368,11 +437,7 @@ def crest_points_to_line(profiles: list[dict], smooth: bool = True) -> LineStrin
 
     coords = np.array(points)
     if smooth and len(coords) > 5:
-        kernel = 5
-        pad = kernel // 2
-        coords_padded = np.pad(coords, ((pad, pad), (0, 0)), mode="edge")
-        for i in range(len(coords)):
-            coords[i] = coords_padded[i : i + kernel].mean(axis=0)
+        coords = _filter_outliers_and_smooth(coords)
 
     return LineString(coords)
 
