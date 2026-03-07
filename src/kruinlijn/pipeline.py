@@ -126,19 +126,22 @@ def kniklijnen_pipeline(
     points_gdf : GeoDataFrame
         GeoDataFrame met alle gedetecteerde knikpunten.
     """
-    # 1. Genereer dwarsprofielen
+    # --- Iteratie 1: detecteer kruinlijn op basis van ruwe hartlijn ---
     profiles = generate_cross_profiles(centerline, spacing=spacing, width=width)
-
-    # 2. Sample hoogtewaardes
     profiles = extract_profile_elevations(profiles, str(dtm_path))
-
-    # 3. Detecteer kruinpunten
     profiles = detect_crest_points(profiles, smooth_sigma=smooth_sigma, method=method)
+    crest_line = crest_points_to_line(profiles)
 
-    # 4. Detecteer knikpunten
+    # --- Iteratie 2: gebruik kruinlijn als verbeterde centerline ---
+    # De kruinlijn volgt de werkelijke dijk, ook in bochten.
+    # Hierdoor staan de dwarsprofielen altijd loodrecht op de dijk.
+    refined_center = crest_line if crest_line is not None else centerline
+    profiles = generate_cross_profiles(refined_center, spacing=spacing, width=width)
+    profiles = extract_profile_elevations(profiles, str(dtm_path))
+    profiles = detect_crest_points(profiles, smooth_sigma=smooth_sigma, method=method)
     profiles = detect_knikpunten(profiles, smooth_sigma=smooth_sigma + 1.0, water_side=water_side)
 
-    # 5. Maak lijnen
+    # Maak lijnen
     crest_line = crest_points_to_line(profiles)
     knik_lines = knikpunten_to_lines(profiles)
     kniklijnen = {"kruin": crest_line, **knik_lines}

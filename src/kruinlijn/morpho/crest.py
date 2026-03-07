@@ -194,6 +194,30 @@ def detect_knikpunten(
             binnen_kruinrand, binnen_teen, binnen_berm = right_kruinrand, right_teen, right_berm
             buiten_kruinrand, buiten_teen, buiten_berm = left_kruinrand, left_teen, left_berm
 
+        # Forceer ruimtelijke volgorde op het profiel:
+        # binnenteen < binnenkruin < crest_idx < buitenkruin < buitenteen
+        # Als een punt de volgorde breekt, verwijder het.
+        if binnen_kruinrand is not None and binnen_kruinrand >= crest_idx:
+            binnen_kruinrand = None
+        if buiten_kruinrand is not None and buiten_kruinrand <= crest_idx:
+            buiten_kruinrand = None
+        if binnen_teen is not None:
+            upper = binnen_kruinrand if binnen_kruinrand is not None else crest_idx
+            if binnen_teen >= upper:
+                binnen_teen = None
+        if buiten_teen is not None:
+            lower = buiten_kruinrand if buiten_kruinrand is not None else crest_idx
+            if buiten_teen <= lower:
+                buiten_teen = None
+        if binnen_berm is not None:
+            if (binnen_teen is not None and binnen_berm <= binnen_teen) or \
+               (binnen_kruinrand is not None and binnen_berm >= binnen_kruinrand):
+                binnen_berm = None
+        if buiten_berm is not None:
+            if (buiten_kruinrand is not None and buiten_berm <= buiten_kruinrand) or \
+               (buiten_teen is not None and buiten_berm >= buiten_teen):
+                buiten_berm = None
+
         _assign_knikpunt(profile, "binnenteen", binnen_teen, pts, z)
         _assign_knikpunt(profile, "binnenberm", binnen_berm, pts, z)
         _assign_knikpunt(profile, "binnenkruin", binnen_kruinrand, pts, z)
