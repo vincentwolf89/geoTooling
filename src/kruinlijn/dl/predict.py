@@ -107,6 +107,9 @@ def predict_tiles(
     prediction /= counts[np.newaxis]
     labels = prediction.argmax(axis=0).astype(np.uint8)
 
+    # Post-processing: morfologische cleanup
+    labels = _postprocess(labels)
+
     # Schrijf output
     profile.update(dtype="uint8", count=1, nodata=0)
     with rasterio.open(output_path, "w", **profile) as dst:
@@ -114,3 +117,39 @@ def predict_tiles(
 
     print(f"Voorspelling opgeslagen: {output_path}")
     return labels
+
+
+def _postprocess(labels: np.ndarray, min_area: int = 100) -> np.ndarray:
+    """Morfologische cleanup van voorspelde labels.
+
+    - Verwijder kleine geïsoleerde gebieden (< min_area pixels)
+    - Sluit kleine gaten via closing
+    - Behoud ruimtelijke samenhang
+    """
+    from scipy.ndimage import binary_opening, binary_closing, label as nd_label
+
+    cleaned = labels.copy()
+
+    # Per klasse (niet achtergrond): verwijder kleine componenten
+    for cls in range(1, NUM_CLASSES):
+        mask = (cleaned == cls)
+        if mask.sum() == 0:
+            continue
+
+        # Closing: vul kleine gaten
+        mask = binary_closing(mask, iterations=2)
+        # Opening: verwijder kleine ruis
+        mask = binary_opening(mask, iterations=1)
+
+        # Verwijder componenten kleiner dan min_area
+        labeled, n_components = nd_label(mask)
+        for comp_id in range(1, n_components + 1):
+            comp_mask = (labeled == comp_id)
+            if comp_mask.sum() < min_area:
+                mask[comp_mask] = False
+
+        # Schrijf terug
+        cleaned[mask & (cleaned == 0)] = cls
+        cleaned[~mask & (cleaned == cls)] = 0
+
+    return cleaned

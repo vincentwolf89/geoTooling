@@ -151,7 +151,7 @@ def _compute_aspect(dtm: np.ndarray) -> np.ndarray:
 def _augment(
     image: np.ndarray, mask: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Eenvoudige augmentatie: random flips en 90-graden rotaties."""
+    """Augmentatie: flips, rotaties, brightness/contrast jitter, noise."""
     # Random horizontale flip
     if np.random.rand() > 0.5:
         image = image[:, :, ::-1].copy()
@@ -165,4 +165,32 @@ def _augment(
     if k > 0:
         image = np.rot90(image, k, axes=(1, 2)).copy()
         mask = np.rot90(mask, k, axes=(0, 1)).copy()
+
+    # Brightness/contrast jitter per kanaal
+    if np.random.rand() > 0.5:
+        for c in range(image.shape[0]):
+            brightness = np.random.uniform(-0.1, 0.1)
+            contrast = np.random.uniform(0.85, 1.15)
+            image[c] = np.clip(image[c] * contrast + brightness, 0, 1)
+
+    # Gaussian noise
+    if np.random.rand() > 0.7:
+        sigma = np.random.uniform(0.01, 0.03)
+        noise = np.random.randn(*image.shape).astype(np.float32) * sigma
+        image = np.clip(image + noise, 0, 1)
+
+    # Elastic-achtige deformatie via random affine shift per rij
+    if np.random.rand() > 0.8:
+        _, h, w = image.shape
+        max_shift = max(1, w // 50)
+        shifts = np.random.randint(-max_shift, max_shift + 1, size=h)
+        # Smooth de shifts
+        from scipy.ndimage import uniform_filter1d
+        shifts = uniform_filter1d(shifts.astype(float), size=10).astype(int)
+        for row in range(h):
+            s = shifts[row]
+            if s != 0:
+                image[:, row, :] = np.roll(image[:, row, :], s, axis=-1)
+                mask[row, :] = np.roll(mask[row, :], s, axis=-1)
+
     return image, mask

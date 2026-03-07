@@ -193,12 +193,14 @@ def generate_training_labels(
     talud_width: float = 12.0,
     teen_buffer: float = 2.0,
     water_side: str | None = None,
+    spacing: float = 2.0,
 ) -> np.ndarray:
-    """Genereer segmentatie-labels op basis van morfologische kniklijnendetectie.
+    """Genereer segmentatie-labels via per-profiel knikpunt-gebaseerde labeling.
 
-    Gebruikt de volledige kniklijnen-pipeline om binnen- en buitenzijde
-    correct te labelen. Zones worden bepaald door de gedetecteerde kniklijnen
-    (binnenkruin, buitenkruin, binnenteen, buitenteen).
+    Loopt langs de hartlijn met dichte profielen. Per profiel worden pixels
+    gelabeld op basis van hun positie t.o.v. de gedetecteerde knikpunten
+    (binnenteen, binnenkruin, buitenkruin, buitenteen). Dit geeft veel
+    preciezere labels dan buffer-gebaseerde zones.
 
     Parameters
     ----------
@@ -209,13 +211,15 @@ def generate_training_labels(
     output_labels_path : str | Path
         Pad voor het output label-raster.
     crest_buffer : float
-        Breedte (m) van de kruinzone rond de gedetecteerde kruinlijn.
+        Halve breedte (m) van de kruinzone.
     talud_width : float
         Fallback breedte (m) als een kniklijn niet gedetecteerd is.
     teen_buffer : float
-        Breedte (m) van de teenzone rond de teenlijnen.
+        Halve breedte (m) van de teenzone.
     water_side : str | None
         'left' of 'right' om buitenzijde te forceren.
+    spacing : float
+        Afstand (m) tussen profielen voor labeling.
 
     Returns
     -------
@@ -223,102 +227,71 @@ def generate_training_labels(
         Label-array (0=achtergrond, 1=kruin, 2=talud_binnen, 3=teen_binnen,
         4=talud_buiten, 5=teen_buiten).
     """
-    from shapely.ops import split
-    from shapely.geometry import Polygon, MultiPolygon
-
-    # Stap 1: detecteer alle kniklijnen
-    kniklijnen, _ = kniklijnen_pipeline(
-        dtm_path, centerline, spacing=2.0, width=60.0,
-        smooth_sigma=2.0, water_side=water_side,
-    )
-
-    crest_line = kniklijnen.get("kruin")
-    if crest_line is None:
-        raise RuntimeError("Kon geen kruinlijn detecteren — kan geen labels genereren.")
+    # Stap 1: detecteer knikpunten op profielen
+    profiles = generate_cross_profiles(centerline, spacing=spacing, width=60.0)
+    profiles = extract_profile_elevations(profiles, str(dtm_path))
+    profiles = detect_crest_points(profiles, smooth_sigma=2.0, method="curvature")
+    profiles = detect_knikpunten(profiles, smooth_sigma=3.0, water_side=water_side)
 
     with rasterio.open(dtm_path) as src:
         raster_shape = (src.height, src.width)
         transform = src.transform
         profile = src.profile.copy()
 
-    # Stap 2: bouw zones uit kniklijnen
-    binnenkruin = kniklijnen.get("binnenkruin")
-    buitenkruin = kniklijnen.get("buitenkruin")
-    binnenteen = kniklijnen.get("binnenteen")
-    buitenteen = kniklijnen.get("buitenteen")
+    labels = np.zeros(raster_shape, dtype=np.uint8)
 
-    # Kruin zone: gebied tussen binnenkruin en buitenkruin
-    if binnenkruin and buitenkruin:
-        kruin_zone = crest_line.buffer(crest_buffer)
-        bk_buf = binnenkruin.buffer(0.5)
-        buk_buf = buitenkruin.buffer(0.5)
-        kruin_zone = kruin_zone.union(bk_buf).union(buk_buf).convex_hull.intersection(
-            crest_line.buffer(crest_buffer + 3.0)
-        )
-    else:
-        kruin_zone = crest_line.buffer(crest_buffer)
+    # Stap 2: per profiel, label pixels via vectorized coords
+    inv_a = 1.0 / transform.a
+    inv_e = 1.0 / transform.e
 
-    # Talud binnen: zone tussen binnenkruin en binnenteen
-    if binnenkruin and binnenteen:
-        talud_binnen_zone = binnenkruin.buffer(talud_width).intersection(
-            binnenteen.buffer(talud_width)
-        )
-        talud_binnen_zone = talud_binnen_zone.difference(kruin_zone)
-    elif binnenkruin:
-        buf = binnenkruin.buffer(talud_width)
-        talud_binnen_zone = buf.difference(kruin_zone)
-    else:
-        buf = crest_line.buffer(crest_buffer + talud_width)
-        talud_binnen_zone = buf.difference(kruin_zone)
-        # Neem alleen de binnenzijde (beperkt tot halve buffer)
-        half = crest_line.buffer(crest_buffer + talud_width / 2)
-        talud_binnen_zone = talud_binnen_zone.intersection(half)
+    for p in profiles:
+        crest_idx = p.get("crest_idx")
+        if crest_idx is None:
+            continue
 
-    # Talud buiten: zone tussen buitenkruin en buitenteen
-    if buitenkruin and buitenteen:
-        talud_buiten_zone = buitenkruin.buffer(talud_width).intersection(
-            buitenteen.buffer(talud_width)
-        )
-        talud_buiten_zone = talud_buiten_zone.difference(kruin_zone)
-    elif buitenkruin:
-        buf = buitenkruin.buffer(talud_width)
-        talud_buiten_zone = buf.difference(kruin_zone)
-    else:
-        buf = crest_line.buffer(crest_buffer + talud_width)
-        talud_buiten_zone = buf.difference(kruin_zone)
+        offsets = p["offsets"]
+        line = p["line"]
+        n_pts = len(offsets)
 
-    # Verwijder overlap tussen talud_binnen en talud_buiten
-    talud_binnen_zone = talud_binnen_zone.difference(talud_buiten_zone.intersection(talud_binnen_zone).buffer(-0.1))
+        # Haal profiel-coördinaten direct uit de LineString (veel sneller)
+        coords = np.array(line.coords)
+        if len(coords) != n_pts:
+            # Interpoleer indien nodig
+            fracs = np.linspace(0, 1, n_pts)
+            xs = np.interp(fracs, np.linspace(0, 1, len(coords)), coords[:, 0])
+            ys = np.interp(fracs, np.linspace(0, 1, len(coords)), coords[:, 1])
+        else:
+            xs, ys = coords[:, 0], coords[:, 1]
 
-    # Teen zones: smalle zone rond teenlijnen
-    teen_binnen_zone = binnenteen.buffer(teen_buffer) if binnenteen else None
-    teen_buiten_zone = buitenteen.buffer(teen_buffer) if buitenteen else None
+        # Vectorized pixel-coordinaten
+        cols = np.round((xs - transform.c) * inv_a).astype(int)
+        rows = np.round((ys - transform.f) * inv_e).astype(int)
 
-    # Verwijder teen overlap met talud
-    if teen_binnen_zone:
-        teen_binnen_zone = teen_binnen_zone.difference(kruin_zone)
-    if teen_buiten_zone:
-        teen_buiten_zone = teen_buiten_zone.difference(kruin_zone)
+        # Knikpunt-indices
+        bk_idx = p.get("binnenkruin_idx")
+        buk_idx = p.get("buitenkruin_idx")
+        bt_idx = p.get("binnenteen_idx")
+        but_idx = p.get("buitenteen_idx")
 
-    # Stap 3: rasterize — van buiten naar binnen (later overschrijft eerder)
-    shapes_and_labels = []
-    if teen_buiten_zone and not teen_buiten_zone.is_empty:
-        shapes_and_labels.append((mapping(teen_buiten_zone), 5))
-    if teen_binnen_zone and not teen_binnen_zone.is_empty:
-        shapes_and_labels.append((mapping(teen_binnen_zone), 3))
-    if not talud_buiten_zone.is_empty:
-        shapes_and_labels.append((mapping(talud_buiten_zone), 4))
-    if not talud_binnen_zone.is_empty:
-        shapes_and_labels.append((mapping(talud_binnen_zone), 2))
-    shapes_and_labels.append((mapping(kruin_zone), 1))
+        # Classificeer alle punten vectorized
+        for i in range(n_pts):
+            r, c = rows[i], cols[i]
+            if r < 0 or r >= raster_shape[0] or c < 0 or c >= raster_shape[1]:
+                continue
 
-    labels = rasterize(
-        shapes_and_labels,
-        out_shape=raster_shape,
-        transform=transform,
-        fill=0,
-        dtype=np.uint8,
-    )
+            label = _classify_profile_point(
+                i, crest_idx, bk_idx, buk_idx, bt_idx, but_idx,
+                crest_buffer, teen_buffer, offsets,
+            )
+            if label > 0:
+                labels[r, c] = label
+
+    # Stap 3: morfologische dilation om gaten te vullen
+    from scipy.ndimage import maximum_filter
+    n_dilate = max(2, int(spacing / 0.5))
+    for _ in range(n_dilate):
+        dilated = maximum_filter(labels, size=3)
+        labels = np.where(labels == 0, dilated, labels)
 
     # Stap 4: schrijf label-raster
     profile.update(dtype="uint8", count=1, nodata=0)
@@ -327,3 +300,61 @@ def generate_training_labels(
 
     print(f"Labels gegenereerd: {output_labels_path}")
     return labels
+
+
+def _classify_profile_point(
+    i: int, crest_idx: int,
+    bk_idx: int | None, buk_idx: int | None,
+    bt_idx: int | None, but_idx: int | None,
+    crest_half: float, teen_half: float,
+    offsets: np.ndarray,
+) -> int:
+    """Classificeer een profiel-punt op basis van knikpunt-posities.
+
+    Returns label: 0=achtergrond, 1=kruin, 2=talud_binnen, 3=teen_binnen,
+    4=talud_buiten, 5=teen_buiten.
+    """
+    offset = offsets[i]
+    crest_offset = offsets[crest_idx]
+
+    # Bepaal kruinzone-grenzen
+    kruin_left = offsets[bk_idx] if bk_idx is not None else crest_offset - crest_half
+    kruin_right = offsets[buk_idx] if buk_idx is not None else crest_offset + crest_half
+    if kruin_left > kruin_right:
+        kruin_left, kruin_right = kruin_right, kruin_left
+
+    # Kruin
+    if kruin_left - 0.5 <= offset <= kruin_right + 0.5:
+        return 1
+
+    # Binnenzijde (links van kruin in offset-ruimte, maar dit is al correct
+    # want detect_knikpunten plaatst binnen-punten links van crest)
+    if offset < kruin_left:
+        # Teen binnen
+        if bt_idx is not None:
+            bt_offset = offsets[bt_idx]
+            if abs(offset - bt_offset) <= teen_half:
+                return 3
+            # Talud binnen: tussen teen en kruinrand
+            if bt_offset <= offset < kruin_left:
+                return 2
+            # Voorbij de teen = achtergrond
+            return 0
+        else:
+            # Geen teen gedetecteerd: alles tot max talud_width is talud
+            return 2 if offset >= kruin_left - 15.0 else 0
+
+    # Buitenzijde (rechts van kruin)
+    if offset > kruin_right:
+        if but_idx is not None:
+            but_offset = offsets[but_idx]
+            if abs(offset - but_offset) <= teen_half:
+                return 5
+            # Talud buiten: tussen kruinrand en teen
+            if kruin_right < offset <= but_offset:
+                return 4
+            return 0
+        else:
+            return 4 if offset <= kruin_right + 15.0 else 0
+
+    return 0
