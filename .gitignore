@@ -19,7 +19,9 @@ env/
 *.swo
 
 # Data files (large)
-data/raw/
+data/raw/*.tif
+data/raw/*.las
+data/raw/*.laz
 data/processed/
 *.h5
 *.hdf5
@@ -27,6 +29,9 @@ data/processed/
 *.las
 *.laz
 *.npy
+
+# Allow small training data (GeoJSON)
+!data/raw/*.geojson
 
 # Model checkpoints
 *.pt
