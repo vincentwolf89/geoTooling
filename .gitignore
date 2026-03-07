@@ -19,17 +19,24 @@ env/
 *.swo
 
 # Data files (large)
-data/raw/*.tif
-data/raw/*.las
-data/raw/*.laz
-data/processed/*.tif
-data/processed/*.npy
+data/raw/
+data/processed/
 *.h5
 *.hdf5
+*.tif
+*.las
+*.laz
+*.npy
 
 # Model checkpoints
-models/checkpoints/*.pt
-models/checkpoints/*.pth
+*.pt
+*.pth
+
+# Output data (large)
+output/**/*.tif
+output/**/*.gpkg
+output/**/*.png
+output/**/checkpoints/
 
 # OS
 .DS_Store
