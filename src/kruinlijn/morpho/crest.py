@@ -161,13 +161,16 @@ def detect_knikpunten(
         margin = 3  # minimale afstand tot rasterrand
 
         # Detecteer knikpunten op beide zijden van de kruin
+        # Met max afstand beperking zodat we niet buiten de dijk zoeken
         left_kruinrand, left_teen = _detect_side_knikpunten(
             z_smooth, d2z, margin, crest_idx,
             is_left=True,
+            offsets=offsets, crest_idx=crest_idx,
         )
         right_kruinrand, right_teen = _detect_side_knikpunten(
             z_smooth, d2z, crest_idx + 1, len(z) - margin,
             is_left=False,
+            offsets=offsets, crest_idx=crest_idx,
         )
 
         # Detecteer bermen (vlakke stukken op het talud)
@@ -207,8 +210,20 @@ def _detect_side_knikpunten(
     start: int,
     end: int,
     is_left: bool,
+    offsets: np.ndarray | None = None,
+    crest_idx: int | None = None,
+    max_kruinrand_dist: float = 8.0,
+    max_teen_dist: float = 25.0,
 ) -> tuple[int | None, int | None]:
     """Detecteer kruinrand en teen op één zijde van de kruin.
+
+    Parameters
+    ----------
+    max_kruinrand_dist : float
+        Maximale afstand (m) van de kruinrand tot de kruin.
+    max_teen_dist : float
+        Maximale afstand (m) van de teen tot de kruin.
+        Voorkomt dat de detectie buiten de dijk gaat.
 
     Returns
     -------
@@ -223,20 +238,34 @@ def _detect_side_knikpunten(
     kruinrand_idx = None
     teen_idx = None
 
+    # Bepaal afstandslimiet in indices (als offsets beschikbaar)
+    crest_offset = offsets[crest_idx] if offsets is not None and crest_idx is not None else None
+
+    def _within_max_dist(idx: int, max_dist: float) -> bool:
+        """Check of index binnen maximale afstand van kruin ligt."""
+        if crest_offset is None or offsets is None:
+            return True
+        return abs(offsets[idx] - crest_offset) <= max_dist
+
     # Kruinrand: negatieve krommingspiek dichtst bij de kruin
-    neg_peaks, _ = find_peaks(-side_d2z, prominence=0.001)
+    neg_peaks, neg_props = find_peaks(-side_d2z, prominence=0.002)
     if len(neg_peaks) > 0:
-        # Links: dichtst bij kruin = hoogste index; rechts: laagste index
-        best = neg_peaks[-1] if is_left else neg_peaks[0]
-        kruinrand_idx = int(best + start)
+        global_neg = neg_peaks + start
+        # Filter op maximale afstand
+        valid = [i for i, gp in enumerate(global_neg)
+                 if _within_max_dist(gp, max_kruinrand_dist)]
+        if valid:
+            # Links: dichtst bij kruin = hoogste index; rechts: laagste
+            best = valid[-1] if is_left else valid[0]
+            kruinrand_idx = int(global_neg[best])
 
     # Teen: positieve krommingspiek, verder van kruin dan kruinrand
-    pos_peaks, pos_props = find_peaks(side_d2z, prominence=0.001)
+    pos_peaks, pos_props = find_peaks(side_d2z, prominence=0.002)
     if len(pos_peaks) > 0:
         global_peaks = pos_peaks + start
         prominences = pos_props["prominences"]
 
-        # Filter: teen moet verder van de kruin liggen dan kruinrand
+        # Filter 1: teen moet verder van de kruin liggen dan kruinrand
         if kruinrand_idx is not None:
             if is_left:
                 mask = global_peaks < kruinrand_idx
@@ -244,6 +273,11 @@ def _detect_side_knikpunten(
                 mask = global_peaks > kruinrand_idx
         else:
             mask = np.ones(len(pos_peaks), dtype=bool)
+
+        # Filter 2: teen moet binnen maximale afstand van kruin
+        dist_mask = np.array([_within_max_dist(gp, max_teen_dist)
+                              for gp in global_peaks])
+        mask = mask & dist_mask
 
         if mask.any():
             # Neem de meest prominente kandidaat
