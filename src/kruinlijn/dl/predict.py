@@ -16,6 +16,7 @@ def predict_tiles(
     dtm_path: str | Path,
     model_path: str | Path,
     output_path: str | Path,
+    rgb_path: str | Path | None = None,
     tile_size: int = 256,
     overlap: int = 32,
     in_channels: int = 2,
@@ -31,6 +32,8 @@ def predict_tiles(
         Pad naar het opgeslagen model (.pt).
     output_path : str | Path
         Pad voor het output GeoTIFF met klasselabels.
+    rgb_path : str | Path | None
+        Optioneel pad naar luchtfoto GeoTIFF (RGB).
     tile_size : int
         Grootte van de sliding window.
     overlap : int
@@ -62,6 +65,14 @@ def predict_tiles(
     dtm = np.nan_to_num(dtm, nan=0.0)
     h, w = dtm.shape
 
+    # Lees RGB indien beschikbaar
+    rgb = None
+    if rgb_path is not None:
+        rgb_path = Path(rgb_path)
+        if rgb_path.exists():
+            with rasterio.open(rgb_path) as src:
+                rgb = src.read().astype(np.float32)  # (3, H, W)
+
     # Resultaat-arrays
     prediction = np.zeros((NUM_CLASSES, h, w), dtype=np.float32)
     counts = np.zeros((h, w), dtype=np.float32)
@@ -80,6 +91,9 @@ def predict_tiles(
                 channels = [_normalize(tile)]
                 if in_channels >= 2:
                     channels.append(_normalize(_compute_slope(tile)))
+                if rgb is not None:
+                    for band in range(rgb.shape[0]):
+                        channels.append(_normalize(rgb[band, ys:ye, xs:xe]))
 
                 inp = np.stack(channels, axis=0)[np.newaxis]
                 inp_t = torch.from_numpy(inp).to(device)

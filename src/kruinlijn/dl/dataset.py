@@ -32,6 +32,8 @@ class DikeTileDataset(Dataset):
     labels_dir : str | Path
         Map met label GeoTIFF-tiles (zelfde bestandsnamen als tiles_dir).
         Pixelwaarden 0..5 conform ``CLASSES``.
+    rgb_dir : str | Path | None
+        Optionele map met luchtfoto-tiles (RGB GeoTIFF, zelfde bestandsnamen).
     tile_size : int
         Verwachte tilegrootte in pixels (tiles worden gecheckt).
     include_slope : bool
@@ -46,6 +48,7 @@ class DikeTileDataset(Dataset):
         self,
         tiles_dir: str | Path,
         labels_dir: str | Path,
+        rgb_dir: str | Path | None = None,
         tile_size: int = 256,
         include_slope: bool = True,
         include_aspect: bool = False,
@@ -53,6 +56,7 @@ class DikeTileDataset(Dataset):
     ):
         self.tiles_dir = Path(tiles_dir)
         self.labels_dir = Path(labels_dir)
+        self.rgb_dir = Path(rgb_dir) if rgb_dir else None
         self.tile_size = tile_size
         self.include_slope = include_slope
         self.include_aspect = include_aspect
@@ -87,6 +91,20 @@ class DikeTileDataset(Dataset):
         if self.include_aspect:
             channels.append(_normalize(_compute_aspect(dtm)))
 
+        # Luchtfoto (RGB) kanalen
+        if self.rgb_dir is not None:
+            rgb_path = self.rgb_dir / tile_path.name
+            if rgb_path.exists():
+                with rasterio.open(rgb_path) as src:
+                    for band in range(1, min(src.count, 3) + 1):
+                        band_data = src.read(band).astype(np.float32)
+                        channels.append(_normalize(band_data))
+            else:
+                # Pad with zeros to keep consistent channel count
+                h, w = dtm.shape
+                for _ in range(3):
+                    channels.append(np.zeros((h, w), dtype=np.float32))
+
         image = np.stack(channels, axis=0)
 
         # Augmentatie
@@ -102,6 +120,8 @@ class DikeTileDataset(Dataset):
             n += 1
         if self.include_aspect:
             n += 1
+        if self.rgb_dir is not None:
+            n += 3  # R, G, B
         return n
 
 

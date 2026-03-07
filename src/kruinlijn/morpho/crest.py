@@ -9,10 +9,12 @@ from shapely.geometry import LineString, Point
 
 # Knikpunt-types die gedetecteerd worden
 KNIKPUNT_TYPES = [
-    "binnenteen",       # overgang polder → binnentalud
-    "kruinrand_binnen", # overgang binnentalud → kruin
-    "kruinrand_buiten", # overgang kruin → buitentalud
-    "buitenteen",       # overgang buitentalud → voorland
+    "binnenteen",   # overgang polder → binnentalud
+    "binnenberm",   # vlak stuk op binnentalud (optioneel, kan None zijn)
+    "binnenkruin",  # overgang binnentalud → kruin
+    "buitenkruin",  # overgang kruin → buitentalud
+    "buitenberm",   # vlak stuk op buitentalud (optioneel, kan None zijn)
+    "buitenteen",   # overgang buitentalud → voorland/water
 ]
 
 
@@ -77,14 +79,18 @@ def detect_crest_points(
 def detect_knikpunten(
     profiles: list[dict],
     smooth_sigma: float = 3.0,
+    water_side: str | None = None,
 ) -> list[dict]:
     """Detecteer alle knikpunten (breeklijnen) per dwarsprofiel.
 
     Knikpunten zijn locaties waar de helling significant verandert:
-    - binnenteen: overgang polder → binnentalud (positieve krommingspiek, binnenzijde)
-    - kruinrand_binnen: overgang binnentalud → kruin (negatieve krommingspiek, binnenzijde)
-    - kruinrand_buiten: overgang kruin → buitentalud (negatieve krommingspiek, buitenzijde)
-    - buitenteen: overgang buitentalud → voorland (positieve krommingspiek, buitenzijde)
+    - binnenteen: overgang polder → binnentalud (positieve krommingspiek, landzijde)
+    - binnenkruin: overgang binnentalud → kruin (negatieve krommingspiek, landzijde)
+    - buitenkruin: overgang kruin → buitentalud (negatieve krommingspiek, waterzijde)
+    - buitenteen: overgang buitentalud → voorland/water (positieve krommingspiek, waterzijde)
+
+    Binnen/buiten kan expliciet opgegeven worden via ``water_side``, of wordt
+    automatisch bepaald: de zijde met de laagste randhoogte = binnenzijde (polder).
 
     Parameters
     ----------
@@ -93,6 +99,10 @@ def detect_knikpunten(
         Moet eerst door detect_crest_points zijn verwerkt.
     smooth_sigma : float
         Sigma voor Gaussische smoothing voor knikpuntdetectie.
+    water_side : str | None
+        Welke zijde van het profiel de waterzijde (buitenzijde) is:
+        - 'left' of 'right': forceer de buitenzijde
+        - None: automatische detectie op basis van randhoogte
 
     Returns
     -------
@@ -122,65 +132,188 @@ def detect_knikpunten(
         # Bereken 2e afgeleide (kromming)
         d2z = np.gradient(np.gradient(z_smooth))
 
-        # Binnenzijde van de dijk (indices < crest_idx, negatieve offsets)
-        # Buitenzijde van de dijk (indices > crest_idx, positieve offsets)
-        margin = 3  # minimale afstand tot rand en kruin
+        margin = 3  # minimale afstand tot rasterrand
 
-        # --- Binnenzijde (links van kruin) ---
-        inner = slice(margin, max(margin + 1, crest_idx - margin))
-        d2z_inner = d2z[inner]
+        # Detecteer knikpunten op beide zijden van de kruin
+        # Zoek tot aan de kruin (niet crest_idx - margin), zodat kruinranden
+        # vlak bij de kruin ook gevonden worden.
+        left_kruinrand, left_teen = _detect_side_knikpunten(
+            z_smooth, d2z, margin, crest_idx,
+            is_left=True,
+        )
+        right_kruinrand, right_teen = _detect_side_knikpunten(
+            z_smooth, d2z, crest_idx + 1, len(z) - margin,
+            is_left=False,
+        )
 
-        if len(d2z_inner) > 2:
-            # Binnenteen: sterkste positieve kromming (concaaf → convex overgang)
-            # = waar het profiel begint te stijgen vanuit de polder
-            pos_peaks, pos_props = find_peaks(d2z_inner, prominence=0.001)
-            if len(pos_peaks) > 0:
-                # Neem de meest prominente positieve krommingspiek
-                best = pos_peaks[np.argmax(pos_props["prominences"])]
-                idx = best + inner.start
-                profile["binnenteen_idx"] = int(idx)
-                profile["binnenteen_xy"] = tuple(pts[idx])
-                profile["binnenteen_z"] = float(z[idx])
+        # Bepaal welke zijde binnen (polder) en buiten (water) is
+        # Heuristiek: de zijde met lagere randhoogte = binnenzijde (polder)
+        edge_n = min(5, margin + 1)
+        left_edge_z = np.nanmean(z_smooth[:edge_n])
+        right_edge_z = np.nanmean(z_smooth[-edge_n:])
 
-            # Kruinrand binnen: sterkste negatieve kromming (convex → concaaf)
-            # = waar het talud overgaat in de kruin
-            neg_peaks, neg_props = find_peaks(-d2z_inner, prominence=0.001)
-            if len(neg_peaks) > 0:
-                # Neem de piek het dichtst bij de kruin
-                best = neg_peaks[-1]
-                idx = best + inner.start
-                profile["kruinrand_binnen_idx"] = int(idx)
-                profile["kruinrand_binnen_xy"] = tuple(pts[idx])
-                profile["kruinrand_binnen_z"] = float(z[idx])
+        # Detecteer bermen (vlakke stukken op het talud)
+        d1z = np.gradient(z_smooth)
+        left_berm = _detect_berm(d1z, left_teen, left_kruinrand)
+        right_berm = _detect_berm(d1z, right_teen, right_kruinrand)
 
-        # --- Buitenzijde (rechts van kruin) ---
-        outer_start = min(crest_idx + margin, len(z) - margin - 1)
-        outer = slice(outer_start, len(z) - margin)
-        d2z_outer = d2z[outer]
+        # Bepaal welke zijde binnen (polder) en buiten (water) is
+        if water_side == "right":
+            left_is_binnen = True
+        elif water_side == "left":
+            left_is_binnen = False
+        else:
+            # Heuristiek: lagere randhoogte = binnenzijde (polder)
+            left_edge_z = np.nanmean(z_smooth[:edge_n])
+            right_edge_z = np.nanmean(z_smooth[-edge_n:])
+            left_is_binnen = left_edge_z <= right_edge_z
 
-        if len(d2z_outer) > 2:
-            # Kruinrand buiten: sterkste negatieve kromming
-            # = waar de kruin overgaat in het buitentalud
-            neg_peaks, neg_props = find_peaks(-d2z_outer, prominence=0.001)
-            if len(neg_peaks) > 0:
-                # Neem de piek het dichtst bij de kruin
-                best = neg_peaks[0]
-                idx = best + outer.start
-                profile["kruinrand_buiten_idx"] = int(idx)
-                profile["kruinrand_buiten_xy"] = tuple(pts[idx])
-                profile["kruinrand_buiten_z"] = float(z[idx])
+        if left_is_binnen:
+            binnen_kruinrand, binnen_teen, binnen_berm = left_kruinrand, left_teen, left_berm
+            buiten_kruinrand, buiten_teen, buiten_berm = right_kruinrand, right_teen, right_berm
+        else:
+            binnen_kruinrand, binnen_teen, binnen_berm = right_kruinrand, right_teen, right_berm
+            buiten_kruinrand, buiten_teen, buiten_berm = left_kruinrand, left_teen, left_berm
 
-            # Buitenteen: sterkste positieve kromming
-            # = waar het buitentalud overgaat in het voorland
-            pos_peaks, pos_props = find_peaks(d2z_outer, prominence=0.001)
-            if len(pos_peaks) > 0:
-                best = pos_peaks[np.argmax(pos_props["prominences"])]
-                idx = best + outer.start
-                profile["buitenteen_idx"] = int(idx)
-                profile["buitenteen_xy"] = tuple(pts[idx])
-                profile["buitenteen_z"] = float(z[idx])
+        _assign_knikpunt(profile, "binnenteen", binnen_teen, pts, z)
+        _assign_knikpunt(profile, "binnenberm", binnen_berm, pts, z)
+        _assign_knikpunt(profile, "binnenkruin", binnen_kruinrand, pts, z)
+        _assign_knikpunt(profile, "buitenkruin", buiten_kruinrand, pts, z)
+        _assign_knikpunt(profile, "buitenberm", buiten_berm, pts, z)
+        _assign_knikpunt(profile, "buitenteen", buiten_teen, pts, z)
 
     return profiles
+
+
+def _detect_side_knikpunten(
+    z_smooth: np.ndarray,
+    d2z: np.ndarray,
+    start: int,
+    end: int,
+    is_left: bool,
+) -> tuple[int | None, int | None]:
+    """Detecteer kruinrand en teen op één zijde van de kruin.
+
+    Returns
+    -------
+    (kruinrand_idx, teen_idx) : tuple[int | None, int | None]
+        Globale indices, of None als niet gedetecteerd.
+    """
+    if end <= start or end - start < 3:
+        return None, None
+
+    side_d2z = d2z[start:end]
+
+    kruinrand_idx = None
+    teen_idx = None
+
+    # Kruinrand: negatieve krommingspiek dichtst bij de kruin
+    neg_peaks, _ = find_peaks(-side_d2z, prominence=0.001)
+    if len(neg_peaks) > 0:
+        # Links: dichtst bij kruin = hoogste index; rechts: laagste index
+        best = neg_peaks[-1] if is_left else neg_peaks[0]
+        kruinrand_idx = int(best + start)
+
+    # Teen: positieve krommingspiek, verder van kruin dan kruinrand
+    pos_peaks, pos_props = find_peaks(side_d2z, prominence=0.001)
+    if len(pos_peaks) > 0:
+        global_peaks = pos_peaks + start
+        prominences = pos_props["prominences"]
+
+        # Filter: teen moet verder van de kruin liggen dan kruinrand
+        if kruinrand_idx is not None:
+            if is_left:
+                mask = global_peaks < kruinrand_idx
+            else:
+                mask = global_peaks > kruinrand_idx
+        else:
+            mask = np.ones(len(pos_peaks), dtype=bool)
+
+        if mask.any():
+            # Neem de meest prominente kandidaat
+            best_i = np.argmax(prominences[mask])
+            teen_idx = int(global_peaks[mask][best_i])
+
+    return kruinrand_idx, teen_idx
+
+
+def _detect_berm(
+    d1z: np.ndarray,
+    teen_idx: int | None,
+    kruinrand_idx: int | None,
+    min_width: int = 3,
+    slope_ratio: float = 0.3,
+) -> int | None:
+    """Detecteer een berm (vlak stuk) op het talud tussen teen en kruinrand.
+
+    Een berm is een zone waar de helling significant lager is dan de
+    gemiddelde helling op het talud. Geeft None als er geen berm is.
+
+    Parameters
+    ----------
+    d1z : np.ndarray
+        Eerste afgeleide (helling) van het gesmoothe profiel.
+    teen_idx, kruinrand_idx : int | None
+        Globale indices van teen en kruinrand. Als een van beide None is,
+        kan geen berm gedetecteerd worden.
+    min_width : int
+        Minimaal aantal samples dat de vlakke zone breed moet zijn.
+    slope_ratio : float
+        De minimale helling in de bermzone moet lager zijn dan dit
+        aandeel van de gemiddelde helling op het talud.
+    """
+    if teen_idx is None or kruinrand_idx is None:
+        return None
+
+    lo, hi = sorted([teen_idx, kruinrand_idx])
+    if hi - lo < min_width + 2:
+        return None
+
+    # Absolute helling op het talud (exclusief de randen)
+    talud_slope = np.abs(d1z[lo + 1 : hi])
+    if len(talud_slope) < min_width:
+        return None
+
+    mean_slope = talud_slope.mean()
+    if mean_slope < 1e-6:
+        return None
+
+    # Zoek de positie met minimale helling
+    min_idx_local = np.argmin(talud_slope)
+    min_slope = talud_slope[min_idx_local]
+
+    # Check of de minimale helling duidelijk lager is dan gemiddeld
+    if min_slope > slope_ratio * mean_slope:
+        return None
+
+    # Check dat er voldoende breedte is rond het minimum
+    threshold = slope_ratio * mean_slope
+    flat_mask = talud_slope < threshold
+    # Zoek de aaneengesloten regio rond het minimum
+    run_start = min_idx_local
+    while run_start > 0 and flat_mask[run_start - 1]:
+        run_start -= 1
+    run_end = min_idx_local
+    while run_end < len(flat_mask) - 1 and flat_mask[run_end + 1]:
+        run_end += 1
+
+    if run_end - run_start + 1 < min_width:
+        return None
+
+    # Berm-punt = midden van de vlakke zone
+    berm_local = (run_start + run_end) // 2
+    return int(berm_local + lo + 1)
+
+
+def _assign_knikpunt(
+    profile: dict, ktype: str, idx: int | None,
+    pts: np.ndarray, z: np.ndarray,
+) -> None:
+    """Wijs een knikpunt toe aan het profiel."""
+    if idx is not None:
+        profile[f"{ktype}_idx"] = idx
+        profile[f"{ktype}_xy"] = tuple(pts[idx])
+        profile[f"{ktype}_z"] = float(z[idx])
 
 
 def knikpunten_to_lines(

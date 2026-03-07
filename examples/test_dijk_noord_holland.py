@@ -34,30 +34,36 @@ from kruinlijn.pipeline import kniklijnen_pipeline
 def maak_synthetisch_dijkprofiel(x_offset: float, variatie: float = 0.0) -> callable:
     """Geeft een functie die de hoogte (m NAP) berekent voor een dwarsprofiel.
 
-    Simuleert een typisch dijkprofiel:
+    Simuleert een typisch dijkprofiel met binnenberm:
     - Polder (binnenzijde): ca. -1.5 m NAP
     - Binnenteen: geleidelijke stijging
-    - Binnentalud: steil omhoog
+    - Binnentalud (onder): steil omhoog
+    - Binnenberm: vlak stuk op ca. 1.5 m NAP
+    - Binnentalud (boven): steil omhoog
     - Kruin: ca. 4.5 m NAP (met lichte variatie)
     - Buitentalud: steil omlaag richting water
     - Buitenteen: overgang naar voorland/water
     - Voorland: ca. 0 m NAP
     """
     kruin_hoogte = 4.5 + variatie
+    berm_hoogte = 1.5
 
     def profiel(afstand_dwars: float) -> float:
         """afstand_dwars: afstand in m loodrecht op hartlijn, negatief = polder, positief = water."""
         d = afstand_dwars
-        if d < -15:
+        if d < -18:
             return -1.5  # polder
+        elif d < -12:
+            # binnenteen → ondertalud
+            t = (d + 18) / 6.0
+            return -1.5 + t * (berm_hoogte + 1.5)
         elif d < -8:
-            # binnenteen naar binnentalud
-            t = (d + 15) / 7.0
-            return -1.5 + t * 1.5
+            # binnenberm (vlak stuk)
+            return berm_hoogte
         elif d < -2:
-            # binnentalud
+            # boventalud → kruin
             t = (d + 8) / 6.0
-            return 0.0 + t * kruin_hoogte
+            return berm_hoogte + t * (kruin_hoogte - berm_hoogte)
         elif d < 2:
             # kruin (vlak)
             return kruin_hoogte
@@ -225,15 +231,19 @@ def main():
     # Kleuren per kniklijn
     kleuren = {
         "kruin": ("red", "-", 2.5),
-        "kruinrand_binnen": ("orange", "--", 1.8),
-        "kruinrand_buiten": ("darkorange", "--", 1.8),
+        "binnenkruin": ("orange", "--", 1.8),
+        "buitenkruin": ("darkorange", "--", 1.8),
+        "binnenberm": ("purple", ":", 1.5),
+        "buitenberm": ("mediumpurple", ":", 1.5),
         "binnenteen": ("green", "-.", 1.8),
         "buitenteen": ("blue", "-.", 1.8),
     }
     labels_nl = {
         "kruin": "Kruin",
-        "kruinrand_binnen": "Kruinrand binnen",
-        "kruinrand_buiten": "Kruinrand buiten",
+        "binnenkruin": "Binnenkruin",
+        "buitenkruin": "Buitenkruin",
+        "binnenberm": "Binnenberm",
+        "buitenberm": "Buitenberm",
         "binnenteen": "Binnenteen",
         "buitenteen": "Buitenteen",
     }
@@ -271,8 +281,10 @@ def main():
     # Plot alle knikpunten op het dwarsprofiel
     knikpunt_info = [
         ("crest", "Kruin", "red", "o"),
-        ("kruinrand_binnen", "Kruinrand binnen", "orange", "s"),
-        ("kruinrand_buiten", "Kruinrand buiten", "darkorange", "s"),
+        ("binnenkruin", "Binnenkruin", "orange", "s"),
+        ("buitenkruin", "Buitenkruin", "darkorange", "s"),
+        ("binnenberm", "Binnenberm", "purple", "D"),
+        ("buitenberm", "Buitenberm", "mediumpurple", "D"),
         ("binnenteen", "Binnenteen", "green", "^"),
         ("buitenteen", "Buitenteen", "blue", "^"),
     ]

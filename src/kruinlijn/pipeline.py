@@ -103,6 +103,7 @@ def kniklijnen_pipeline(
     width: float = 40.0,
     smooth_sigma: float = 2.0,
     method: str = "curvature",
+    water_side: str | None = None,
 ) -> tuple[dict[str, LineString | None], gpd.GeoDataFrame]:
     """Volledige kniklijnendetectie: kruin + binnenteen, buitenteen, kruinranden.
 
@@ -121,7 +122,7 @@ def kniklijnen_pipeline(
     -------
     kniklijnen : dict[str, LineString | None]
         Dict met lijnen per type: 'kruin', 'binnenteen', 'buitenteen',
-        'kruinrand_binnen', 'kruinrand_buiten'.
+        'binnenkruin', 'buitenkruin'.
     points_gdf : GeoDataFrame
         GeoDataFrame met alle gedetecteerde knikpunten.
     """
@@ -135,7 +136,7 @@ def kniklijnen_pipeline(
     profiles = detect_crest_points(profiles, smooth_sigma=smooth_sigma, method=method)
 
     # 4. Detecteer knikpunten
-    profiles = detect_knikpunten(profiles, smooth_sigma=smooth_sigma + 1.0)
+    profiles = detect_knikpunten(profiles, smooth_sigma=smooth_sigma + 1.0, water_side=water_side)
 
     # 5. Maak lijnen
     crest_line = crest_points_to_line(profiles)
@@ -189,13 +190,15 @@ def generate_training_labels(
     centerline: LineString,
     output_labels_path: str | Path,
     crest_buffer: float = 1.5,
-    talud_width: float = 10.0,
+    talud_width: float = 12.0,
     teen_buffer: float = 2.0,
+    water_side: str | None = None,
 ) -> np.ndarray:
-    """Genereer segmentatie-labels op basis van morfologische kruinlijndetectie.
+    """Genereer segmentatie-labels op basis van morfologische kniklijnendetectie.
 
-    Dit is de brug tussen de klassieke en DL-benadering: gebruik de morfologische
-    methode om automatisch trainingsdata te genereren voor het segmentatiemodel.
+    Gebruikt de volledige kniklijnen-pipeline om binnen- en buitenzijde
+    correct te labelen. Zones worden bepaald door de gedetecteerde kniklijnen
+    (binnenkruin, buitenkruin, binnenteen, buitenteen).
 
     Parameters
     ----------
@@ -208,50 +211,110 @@ def generate_training_labels(
     crest_buffer : float
         Breedte (m) van de kruinzone rond de gedetecteerde kruinlijn.
     talud_width : float
-        Geschatte breedte (m) van het talud aan elke zijde.
+        Fallback breedte (m) als een kniklijn niet gedetecteerd is.
     teen_buffer : float
-        Breedte (m) van de teenzone.
+        Breedte (m) van de teenzone rond de teenlijnen.
+    water_side : str | None
+        'left' of 'right' om buitenzijde te forceren.
 
     Returns
     -------
     np.ndarray
-        Label-array (0=achtergrond, 1=kruin, 2=talud_in, 3=teen_in, 4=talud_uit, 5=teen_uit).
+        Label-array (0=achtergrond, 1=kruin, 2=talud_binnen, 3=teen_binnen,
+        4=talud_buiten, 5=teen_buiten).
     """
-    # Stap 1: detecteer kruinlijn via morfologische methode
-    crest_line, _ = morpho_pipeline(dtm_path, centerline, spacing=2.0, width=50.0)
+    from shapely.ops import split
+    from shapely.geometry import Polygon, MultiPolygon
 
+    # Stap 1: detecteer alle kniklijnen
+    kniklijnen, _ = kniklijnen_pipeline(
+        dtm_path, centerline, spacing=2.0, width=60.0,
+        smooth_sigma=2.0, water_side=water_side,
+    )
+
+    crest_line = kniklijnen.get("kruin")
     if crest_line is None:
         raise RuntimeError("Kon geen kruinlijn detecteren — kan geen labels genereren.")
 
     with rasterio.open(dtm_path) as src:
-        shape = (src.height, src.width)
+        raster_shape = (src.height, src.width)
         transform = src.transform
         profile = src.profile.copy()
 
-    # Stap 2: maak zones via buffering
-    # De kruin is een smalle zone rond de kruinlijn
-    crest_zone = crest_line.buffer(crest_buffer)
+    # Stap 2: bouw zones uit kniklijnen
+    binnenkruin = kniklijnen.get("binnenkruin")
+    buitenkruin = kniklijnen.get("buitenkruin")
+    binnenteen = kniklijnen.get("binnenteen")
+    buitenteen = kniklijnen.get("buitenteen")
 
-    # Talud = zone tussen kruin en teen, we benaderen dit door de kruin
-    # verder te bufferen en het verschil te nemen.
-    inner_zone = crest_line.buffer(crest_buffer + talud_width)
-    talud_zone = inner_zone.difference(crest_zone)
+    # Kruin zone: gebied tussen binnenkruin en buitenkruin
+    if binnenkruin and buitenkruin:
+        kruin_zone = crest_line.buffer(crest_buffer)
+        bk_buf = binnenkruin.buffer(0.5)
+        buk_buf = buitenkruin.buffer(0.5)
+        kruin_zone = kruin_zone.union(bk_buf).union(buk_buf).convex_hull.intersection(
+            crest_line.buffer(crest_buffer + 3.0)
+        )
+    else:
+        kruin_zone = crest_line.buffer(crest_buffer)
 
-    outer_zone = inner_zone.buffer(teen_buffer)
-    teen_zone = outer_zone.difference(inner_zone)
+    # Talud binnen: zone tussen binnenkruin en binnenteen
+    if binnenkruin and binnenteen:
+        talud_binnen_zone = binnenkruin.buffer(talud_width).intersection(
+            binnenteen.buffer(talud_width)
+        )
+        talud_binnen_zone = talud_binnen_zone.difference(kruin_zone)
+    elif binnenkruin:
+        buf = binnenkruin.buffer(talud_width)
+        talud_binnen_zone = buf.difference(kruin_zone)
+    else:
+        buf = crest_line.buffer(crest_buffer + talud_width)
+        talud_binnen_zone = buf.difference(kruin_zone)
+        # Neem alleen de binnenzijde (beperkt tot halve buffer)
+        half = crest_line.buffer(crest_buffer + talud_width / 2)
+        talud_binnen_zone = talud_binnen_zone.intersection(half)
+
+    # Talud buiten: zone tussen buitenkruin en buitenteen
+    if buitenkruin and buitenteen:
+        talud_buiten_zone = buitenkruin.buffer(talud_width).intersection(
+            buitenteen.buffer(talud_width)
+        )
+        talud_buiten_zone = talud_buiten_zone.difference(kruin_zone)
+    elif buitenkruin:
+        buf = buitenkruin.buffer(talud_width)
+        talud_buiten_zone = buf.difference(kruin_zone)
+    else:
+        buf = crest_line.buffer(crest_buffer + talud_width)
+        talud_buiten_zone = buf.difference(kruin_zone)
+
+    # Verwijder overlap tussen talud_binnen en talud_buiten
+    talud_binnen_zone = talud_binnen_zone.difference(talud_buiten_zone.intersection(talud_binnen_zone).buffer(-0.1))
+
+    # Teen zones: smalle zone rond teenlijnen
+    teen_binnen_zone = binnenteen.buffer(teen_buffer) if binnenteen else None
+    teen_buiten_zone = buitenteen.buffer(teen_buffer) if buitenteen else None
+
+    # Verwijder teen overlap met talud
+    if teen_binnen_zone:
+        teen_binnen_zone = teen_binnen_zone.difference(kruin_zone)
+    if teen_buiten_zone:
+        teen_buiten_zone = teen_buiten_zone.difference(kruin_zone)
 
     # Stap 3: rasterize — van buiten naar binnen (later overschrijft eerder)
-    # We gebruiken een vereenvoudigd model: links = binnen, rechts = buiten
-    # In werkelijkheid zou je de zijde moeten bepalen t.o.v. de dijk-orientatie
-    shapes_and_labels = [
-        (mapping(teen_zone), 3),       # teen (voorlopig als 'binnen')
-        (mapping(talud_zone), 2),      # talud (voorlopig als 'binnen')
-        (mapping(crest_zone), 1),      # kruin
-    ]
+    shapes_and_labels = []
+    if teen_buiten_zone and not teen_buiten_zone.is_empty:
+        shapes_and_labels.append((mapping(teen_buiten_zone), 5))
+    if teen_binnen_zone and not teen_binnen_zone.is_empty:
+        shapes_and_labels.append((mapping(teen_binnen_zone), 3))
+    if not talud_buiten_zone.is_empty:
+        shapes_and_labels.append((mapping(talud_buiten_zone), 4))
+    if not talud_binnen_zone.is_empty:
+        shapes_and_labels.append((mapping(talud_binnen_zone), 2))
+    shapes_and_labels.append((mapping(kruin_zone), 1))
 
     labels = rasterize(
         shapes_and_labels,
-        out_shape=shape,
+        out_shape=raster_shape,
         transform=transform,
         fill=0,
         dtype=np.uint8,
