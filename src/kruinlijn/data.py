@@ -1,4 +1,4 @@
-"""Data-download functies: AHN4 DTM, luchtfoto, BGT waterdelen, DTB referentielijnen."""
+"""Data-download functies: AHN4 DTM, luchtfoto, BGT waterdelen, DTB/HDSR referentielijnen."""
 
 from __future__ import annotations
 
@@ -533,3 +533,101 @@ def classify_dtb_sides(
         "binnenteen": binnen_teens,
         "buitenteen": buiten_teens,
     }
+
+
+def load_hdsr_kniklijnen(
+    geojson_path: str | Path,
+    bbox: tuple | None = None,
+) -> dict[str, list]:
+    """Laad HDSR kniklijnen uit GeoJSON (EPSG:4326 → EPSG:28992).
+
+    HDSR kniklijnen hebben een 'type' veld dat direct de profiellijn aangeeft:
+    15=teen_binnen, 16=teen_buiten, 17=kruin_binnen, 18=kruin_buiten,
+    60=berm_binnen, 61=berm_buiten, 62=insteek_buiten, 63=insteek_binnen.
+
+    Parameters
+    ----------
+    geojson_path : str | Path
+        Pad naar het HDSR GeoJSON (EPSG:4326).
+    bbox : tuple | None
+        Optioneel (minx, miny, maxx, maxy) in EPSG:28992 om te filteren.
+
+    Returns
+    -------
+    dict[str, list[LineString]]
+        Keys: 'binnenkruin', 'buitenkruin', 'binnenteen', 'buitenteen',
+        'binnenberm', 'buitenberm', 'insteek'.
+    """
+    import json
+    from pyproj import Transformer
+    from shapely.geometry import LineString, shape as shp_shape, box as shp_box
+
+    path = Path(geojson_path)
+    with open(path) as f:
+        data = json.load(f)
+
+    to_rd = Transformer.from_crs("EPSG:4326", "EPSG:28992", always_xy=True)
+    clip_box = shp_box(*bbox) if bbox else None
+
+    # HDSR type codes → onze referentielijn-namen
+    type_map = {
+        15: "binnenteen", 16: "buitenteen",
+        17: "binnenkruin", 18: "buitenkruin",
+        60: "binnenberm", 61: "buitenberm",
+        62: "insteek", 63: "insteek",
+    }
+
+    result = {
+        "binnenkruin": [], "buitenkruin": [],
+        "binnenteen": [], "buitenteen": [],
+        "binnenberm": [], "buitenberm": [],
+        "insteek": [],
+    }
+
+    for feat in data.get("features", []):
+        props = feat.get("properties", {})
+        line_type = props.get("type")
+        target_key = type_map.get(line_type)
+        if target_key is None:
+            continue
+
+        geom = shp_shape(feat["geometry"])
+        if geom.is_empty:
+            continue
+
+        # Converteer naar lijsten van LineStrings
+        if geom.geom_type == "MultiLineString":
+            parts = list(geom.geoms)
+        elif geom.geom_type == "LineString":
+            parts = [geom]
+        else:
+            continue
+
+        for line_wgs in parts:
+            if line_wgs.length < 0.00001:  # WGS84 threshold
+                continue
+
+            # Transform naar RD
+            coords_rd = [to_rd.transform(x, y) for x, y in line_wgs.coords]
+            line = LineString(coords_rd)
+
+            if line.length < 1:
+                continue
+
+            if clip_box is not None:
+                line = line.intersection(clip_box)
+                if line.is_empty:
+                    continue
+                if line.geom_type == "MultiLineString":
+                    line = max(line.geoms, key=lambda g: g.length)
+                elif line.geom_type != "LineString":
+                    continue
+
+            result[target_key].append(line)
+
+    for key, lines in result.items():
+        if lines:
+            total_len = sum(l.length for l in lines)
+            print(f"  HDSR {key}: {len(lines)} lijnen, {total_len:.0f}m")
+
+    return result
