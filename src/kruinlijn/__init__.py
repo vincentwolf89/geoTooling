@@ -1,1 +1,1 @@
-"""Kruinlijn-detectie: morfologische analyse en deep learning voor dijkprofielen."""
+"""Kruinlijn-detectie via deep learning voor dijkprofielen."""

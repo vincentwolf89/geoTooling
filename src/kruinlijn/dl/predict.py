@@ -16,6 +16,7 @@ def predict_tiles(
     dtm_path: str | Path,
     model_path: str | Path,
     output_path: str | Path,
+    rgb_path: str | Path | None = None,
     tile_size: int = 256,
     overlap: int = 32,
     in_channels: int = 2,
@@ -31,6 +32,8 @@ def predict_tiles(
         Pad naar het opgeslagen model (.pt).
     output_path : str | Path
         Pad voor het output GeoTIFF met klasselabels.
+    rgb_path : str | Path | None
+        Optioneel pad naar luchtfoto GeoTIFF (RGB).
     tile_size : int
         Grootte van de sliding window.
     overlap : int
@@ -62,6 +65,14 @@ def predict_tiles(
     dtm = np.nan_to_num(dtm, nan=0.0)
     h, w = dtm.shape
 
+    # Lees RGB indien beschikbaar
+    rgb = None
+    if rgb_path is not None:
+        rgb_path = Path(rgb_path)
+        if rgb_path.exists():
+            with rasterio.open(rgb_path) as src:
+                rgb = src.read().astype(np.float32)  # (3, H, W)
+
     # Resultaat-arrays
     prediction = np.zeros((NUM_CLASSES, h, w), dtype=np.float32)
     counts = np.zeros((h, w), dtype=np.float32)
@@ -80,6 +91,9 @@ def predict_tiles(
                 channels = [_normalize(tile)]
                 if in_channels >= 2:
                     channels.append(_normalize(_compute_slope(tile)))
+                if rgb is not None:
+                    for band in range(rgb.shape[0]):
+                        channels.append(_normalize(rgb[band, ys:ye, xs:xe]))
 
                 inp = np.stack(channels, axis=0)[np.newaxis]
                 inp_t = torch.from_numpy(inp).to(device)
@@ -93,6 +107,9 @@ def predict_tiles(
     prediction /= counts[np.newaxis]
     labels = prediction.argmax(axis=0).astype(np.uint8)
 
+    # Post-processing: morfologische cleanup
+    labels = _postprocess(labels)
+
     # Schrijf output
     profile.update(dtype="uint8", count=1, nodata=0)
     with rasterio.open(output_path, "w", **profile) as dst:
@@ -100,3 +117,39 @@ def predict_tiles(
 
     print(f"Voorspelling opgeslagen: {output_path}")
     return labels
+
+
+def _postprocess(labels: np.ndarray, min_area: int = 100) -> np.ndarray:
+    """Morfologische cleanup van voorspelde labels.
+
+    - Verwijder kleine geïsoleerde gebieden (< min_area pixels)
+    - Sluit kleine gaten via closing
+    - Behoud ruimtelijke samenhang
+    """
+    from scipy.ndimage import binary_opening, binary_closing, label as nd_label
+
+    cleaned = labels.copy()
+
+    # Per klasse (niet achtergrond): verwijder kleine componenten
+    for cls in range(1, NUM_CLASSES):
+        mask = (cleaned == cls)
+        if mask.sum() == 0:
+            continue
+
+        # Closing: vul kleine gaten
+        mask = binary_closing(mask, iterations=2)
+        # Opening: verwijder kleine ruis
+        mask = binary_opening(mask, iterations=1)
+
+        # Verwijder componenten kleiner dan min_area
+        labeled, n_components = nd_label(mask)
+        for comp_id in range(1, n_components + 1):
+            comp_mask = (labeled == comp_id)
+            if comp_mask.sum() < min_area:
+                mask[comp_mask] = False
+
+        # Schrijf terug
+        cleaned[mask & (cleaned == 0)] = cls
+        cleaned[~mask & (cleaned == cls)] = 0
+
+    return cleaned

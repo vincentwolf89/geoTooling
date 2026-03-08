@@ -32,6 +32,8 @@ class DikeTileDataset(Dataset):
     labels_dir : str | Path
         Map met label GeoTIFF-tiles (zelfde bestandsnamen als tiles_dir).
         Pixelwaarden 0..5 conform ``CLASSES``.
+    rgb_dir : str | Path | None
+        Optionele map met luchtfoto-tiles (RGB GeoTIFF, zelfde bestandsnamen).
     tile_size : int
         Verwachte tilegrootte in pixels (tiles worden gecheckt).
     include_slope : bool
@@ -46,6 +48,7 @@ class DikeTileDataset(Dataset):
         self,
         tiles_dir: str | Path,
         labels_dir: str | Path,
+        rgb_dir: str | Path | None = None,
         tile_size: int = 256,
         include_slope: bool = True,
         include_aspect: bool = False,
@@ -53,6 +56,7 @@ class DikeTileDataset(Dataset):
     ):
         self.tiles_dir = Path(tiles_dir)
         self.labels_dir = Path(labels_dir)
+        self.rgb_dir = Path(rgb_dir) if rgb_dir else None
         self.tile_size = tile_size
         self.include_slope = include_slope
         self.include_aspect = include_aspect
@@ -87,6 +91,20 @@ class DikeTileDataset(Dataset):
         if self.include_aspect:
             channels.append(_normalize(_compute_aspect(dtm)))
 
+        # Luchtfoto (RGB) kanalen
+        if self.rgb_dir is not None:
+            rgb_path = self.rgb_dir / tile_path.name
+            if rgb_path.exists():
+                with rasterio.open(rgb_path) as src:
+                    for band in range(1, min(src.count, 3) + 1):
+                        band_data = src.read(band).astype(np.float32)
+                        channels.append(_normalize(band_data))
+            else:
+                # Pad with zeros to keep consistent channel count
+                h, w = dtm.shape
+                for _ in range(3):
+                    channels.append(np.zeros((h, w), dtype=np.float32))
+
         image = np.stack(channels, axis=0)
 
         # Augmentatie
@@ -102,6 +120,8 @@ class DikeTileDataset(Dataset):
             n += 1
         if self.include_aspect:
             n += 1
+        if self.rgb_dir is not None:
+            n += 3  # R, G, B
         return n
 
 
@@ -131,7 +151,7 @@ def _compute_aspect(dtm: np.ndarray) -> np.ndarray:
 def _augment(
     image: np.ndarray, mask: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Eenvoudige augmentatie: random flips en 90-graden rotaties."""
+    """Augmentatie: flips, rotaties, brightness/contrast jitter, noise."""
     # Random horizontale flip
     if np.random.rand() > 0.5:
         image = image[:, :, ::-1].copy()
@@ -145,4 +165,32 @@ def _augment(
     if k > 0:
         image = np.rot90(image, k, axes=(1, 2)).copy()
         mask = np.rot90(mask, k, axes=(0, 1)).copy()
+
+    # Brightness/contrast jitter per kanaal
+    if np.random.rand() > 0.5:
+        for c in range(image.shape[0]):
+            brightness = np.random.uniform(-0.1, 0.1)
+            contrast = np.random.uniform(0.85, 1.15)
+            image[c] = np.clip(image[c] * contrast + brightness, 0, 1)
+
+    # Gaussian noise
+    if np.random.rand() > 0.7:
+        sigma = np.random.uniform(0.01, 0.03)
+        noise = np.random.randn(*image.shape).astype(np.float32) * sigma
+        image = np.clip(image + noise, 0, 1)
+
+    # Elastic-achtige deformatie via random affine shift per rij
+    if np.random.rand() > 0.8:
+        _, h, w = image.shape
+        max_shift = max(1, w // 50)
+        shifts = np.random.randint(-max_shift, max_shift + 1, size=h)
+        # Smooth de shifts
+        from scipy.ndimage import uniform_filter1d
+        shifts = uniform_filter1d(shifts.astype(float), size=10).astype(int)
+        for row in range(h):
+            s = shifts[row]
+            if s != 0:
+                image[:, row, :] = np.roll(image[:, row, :], s, axis=-1)
+                mask[row, :] = np.roll(mask[row, :], s, axis=-1)
+
     return image, mask
