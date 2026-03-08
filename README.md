@@ -1,113 +1,110 @@
-# geoTooling — Kruinlijndetectie
+# geoTooling — Dijksegmentatie via Deep Learning
 
-Automatische detectie van kruinlijnen (en andere dijkonderdelen) op basis van DTM-data, via twee benaderingen:
+Automatische detectie van dijkonderdelen (kruinlijn, teenlijnen, taluds, bermen, insteek, sloot) op basis van AHN4 hoogte-data en luchtfoto's, met een Attention U-Net segmentatiemodel.
 
-1. **Morfologische analyse** — dwarsprofielen langs de dijk, knikpuntdetectie via kromming/2e afgeleide
-2. **Deep Learning** — U-Net semantic segmentation voor per-pixel classificatie (kruin, talud, teen)
-3. **Hybride pipeline** — morfologische methode genereert automatisch trainingsdata voor het DL-model
+## Aanpak
+
+1. **Referentielijnen als labels** — DTB-lijnen (RWS) of handmatig ingemeten lijnen worden samen met BGT waterdelen omgezet naar segmentatie-rasters
+2. **Multi-channel input** — 9 kanalen: DTM + slope + aspect + curvature + TPI + nDSM + R + G + B
+3. **Attention U-Net + ASPP + SE** — Segmentatiemodel met attention gates, atrous spatial pyramid pooling, en squeeze-excitation channel attention
+4. **Sliding window predict** — Voorspelling op willekeurig grote gebieden via overlappende tiles
+5. **Vectorisatie** — Pixel-classificatie wordt omgezet naar vectorlijnen (GeoPackage)
 
 ## Projectstructuur
 
 ```
 geoTooling/
 ├── src/kruinlijn/
-│   ├── morpho/           # Klassieke morfologische analyse
-│   │   ├── profiles.py   # Dwarsprofielgeneratie langs dijklijn
-│   │   └── crest.py      # Kruinpuntdetectie (peak/curvature)
-│   ├── dl/               # Deep learning segmentatie
-│   │   ├── dataset.py    # PyTorch dataset (DTM tiles + labels)
-│   │   ├── model.py      # U-Net architectuur
-│   │   ├── train.py      # Training loop
-│   │   └── predict.py    # Sliding window voorspelling
-│   └── pipeline.py       # Hybride pipeline (morpho -> labels -> DL)
+│   ├── data.py             # Data downloads (AHN4 DTM/DSM, luchtfoto, BGT, DTB)
+│   ├── pipeline.py         # Label-generatie uit referentielijnen
+│   └── dl/
+│       ├── dataset.py      # PyTorch dataset (9 kanalen, augmentatie)
+│       ├── model.py        # Attention U-Net + ASPP + SE blocks
+│       ├── train.py        # Training: Focal Loss + Dice Loss, deep supervision
+│       ├── predict.py      # Sliding window voorspelling + post-processing
+│       └── vectorize.py    # Pixel → vectorlijnen
 ├── examples/
-│   ├── demo_morpho.py    # Demo: alleen morfologische analyse
-│   └── demo_hybrid.py    # Demo: volledige hybride pipeline
-├── data/                 # Data (niet in git)
-├── models/checkpoints/   # Model checkpoints (niet in git)
+│   ├── train_with_dtb.py         # Training met DTB referentielijnen
+│   ├── train_with_real_labels.py # Training met WSRL referentielijnen
+│   └── predict_area.py           # Voorspelling op nieuw dijkgebied
+├── data/raw/               # Referentielijnen, trajecten (niet in git)
 └── pyproject.toml
 ```
 
 ## Installatie
 
 ```bash
-# Clone en maak virtual environment
 git clone <repo-url> && cd geoTooling
 python -m venv .venv
-source .venv/bin/activate  # Linux/Mac
-# .venv\Scripts\activate   # Windows
+.venv\Scripts\activate      # Windows
+# source .venv/bin/activate # Linux/Mac
 
-# Basis (alleen morfologische analyse)
-pip install -e .
-
-# Met deep learning support
 pip install -e ".[dl]"
-
-# Development
-pip install -e ".[dev]"
 ```
 
 ## Gebruik
 
-### Morfologische analyse
-
-```python
-from shapely.geometry import LineString
-from kruinlijn.pipeline import morpho_pipeline
-
-# Definieer een hartlijn van de dijk (of lees uit GeoPackage)
-centerline = LineString([(x1, y1), (x2, y2), ...])
-
-# Detecteer kruinlijn
-crest_line, points_gdf = morpho_pipeline(
-    dtm_path="data/raw/dtm.tif",
-    centerline=centerline,
-    output_gpkg="output/kruinlijn.gpkg",
-    spacing=5.0,       # 5m tussen profielen
-    width=40.0,        # 40m breed dwarsprofiel
-    method="curvature", # of "peak"
-)
-```
-
-### Hybride pipeline (morfologisch + DL)
+### Training met DTB referentielijnen
 
 ```bash
-python examples/demo_hybrid.py data/raw/dtm.tif data/raw/hartlijn.gpkg output/
+# Standaard: gebruikt data/raw/dtb_kruinlijnen_selectie.geojson
+python examples/train_with_dtb.py
+
+# Of met een eigen DTB-export:
+python examples/train_with_dtb.py data/raw/mijn_dtb.geojson
 ```
 
-Dit doet automatisch:
-1. Kruinlijndetectie via morfologische analyse
-2. Genereren van segmentatielabels (kruin/talud/teen zones)
-3. Knippen van trainingstiles
-4. Trainen van een U-Net model
-5. Voorspelling op het volledige DTM
+### Voorspelling op een nieuw gebied
 
-### Klassen (segmentatie)
+```bash
+python examples/predict_area.py data/raw/traject.geojson [model.pt] [output_dir]
+```
 
-| Label | Klasse         |
-|-------|----------------|
-| 0     | Achtergrond    |
-| 1     | Kruin          |
-| 2     | Talud binnen   |
-| 3     | Teen binnen    |
-| 4     | Talud buiten   |
-| 5     | Teen buiten    |
+### Klassen (10-klasse segmentatie)
 
-## Benodigde input
+| Label | Klasse         | Beschrijving                     |
+|-------|----------------|----------------------------------|
+| 0     | Achtergrond    | Geen dijk                        |
+| 1     | Kruin          | Kruinzone van de dijk            |
+| 2     | Talud binnen   | Binnenzijde (polder) talud       |
+| 3     | Binnenberm     | Berm aan polderzijde             |
+| 4     | Teen binnen    | Teen aan polderzijde             |
+| 5     | Talud buiten   | Buitenzijde (water) talud        |
+| 6     | Buitenberm     | Berm aan waterzijde              |
+| 7     | Teen buiten    | Teen aan waterzijde              |
+| 8     | Insteek        | Rand waterdeel (overgang sloot)   |
+| 9     | Sloot          | Wateroppervlak                   |
 
-- **DTM**: GeoTIFF, bij voorkeur 0.5m of 1m resolutie (AHN3/AHN4)
-- **Hartlijn**: GeoPackage/Shapefile met een LineString die globaal over de dijk loopt
-- Optioneel: luchtfoto (nog niet geimplementeerd als extra inputkanaal)
+## Data bronnen
 
-## Methode-details
+| Bron | Beschrijving | URL |
+|------|-------------|-----|
+| AHN4 DTM | Hoogtemodel (maaiveldhoogte, 50cm) | ArcGIS ImageServer |
+| AHN4 DSM | Oppervlaktemodel (incl. objecten) | ArcGIS ImageServer |
+| PDOK Luchtfoto | RGB luchtfoto | ArcGIS MapServer |
+| BGT Waterdeel | Sloten, waterlopen | PDOK OGC Features API |
+| DTB | Professioneel ingemeten dijklijnen (RWS) | WFS / GeoJSON export |
 
-### Morfologisch
-- Genereert dwarsprofielen loodrecht op de dijkhartlijn
-- Per profiel: Gaussische smoothing -> 2e afgeleide (kromming) -> piekdetectie
-- Kruinpunten worden verbonden tot een vloeiende kruinlijn
+## Model architectuur
 
-### Deep Learning
-- Lichtgewicht U-Net (32 base features, 4 encoder-blokken)
-- Input: DTM + slope (2 kanalen), optioneel aspect
-- Class weighting: kruin-klasse krijgt extra gewicht (3x)
-- Sliding window met overlap voor naadloze voorspelling
+- **Backbone**: Attention U-Net (32 base features, 4 encoder blokken)
+- **Bottleneck**: ASPP (Atrous Spatial Pyramid Pooling) met dilations 6, 12 + global pooling
+- **Channel attention**: Squeeze-Excitation blocks per ConvBlock
+- **Residual connections**: 1x1 shortcut conv bij kanaalwijziging
+- **Deep supervision**: Auxiliary outputs op decoder level 2 en 3
+- **Loss**: Focal Loss (γ=2) + Dice Loss met automatische class weights
+- **~14.7M parameters**, 9 input kanalen, 10 output klassen
+
+## Input kanalen
+
+| # | Kanaal | Beschrijving |
+|---|--------|-------------|
+| 1 | DTM | Maaiveldhoogte (genormaliseerd) |
+| 2 | Slope | Helling (1e afgeleide) |
+| 3 | Aspect | Hellingsrichting |
+| 4 | Curvature | Kromming (Laplaciaan) |
+| 5 | TPI | Topographic Position Index (hoogte t.o.v. omgeving) |
+| 6 | nDSM | DSM - DTM (vegetatie/objecthoogte) |
+| 7 | R | Rood kanaal luchtfoto |
+| 8 | G | Groen kanaal luchtfoto |
+| 9 | B | Blauw kanaal luchtfoto |

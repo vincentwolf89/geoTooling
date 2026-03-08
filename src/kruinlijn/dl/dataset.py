@@ -15,9 +15,13 @@ CLASSES = {
     0: "achtergrond",
     1: "kruin",
     2: "talud_binnen",
-    3: "teen_binnen",
-    4: "talud_buiten",
-    5: "teen_buiten",
+    3: "binnenberm",
+    4: "teen_binnen",
+    5: "talud_buiten",
+    6: "buitenberm",
+    7: "teen_buiten",
+    8: "insteek",
+    9: "sloot",
 }
 NUM_CLASSES = len(CLASSES)
 
@@ -31,15 +35,20 @@ class DikeTileDataset(Dataset):
         Map met DTM GeoTIFF-tiles.
     labels_dir : str | Path
         Map met label GeoTIFF-tiles (zelfde bestandsnamen als tiles_dir).
-        Pixelwaarden 0..5 conform ``CLASSES``.
     rgb_dir : str | Path | None
         Optionele map met luchtfoto-tiles (RGB GeoTIFF, zelfde bestandsnamen).
+    dsm_dir : str | Path | None
+        Optionele map met DSM-tiles voor nDSM (DSM - DTM) kanaal.
     tile_size : int
-        Verwachte tilegrootte in pixels (tiles worden gecheckt).
+        Verwachte tilegrootte in pixels.
     include_slope : bool
         Voeg een slope-kanaal toe naast het hoogtekanaal.
     include_aspect : bool
-        Voeg een aspect-kanaal toe.
+        Voeg een aspect-kanaal toe (hellingsrichting).
+    include_curvature : bool
+        Voeg een curvature-kanaal toe (2e afgeleide, markeert knikpunten).
+    include_tpi : bool
+        Voeg TPI-kanaal toe (Topographic Position Index, relatieve hoogte).
     augment : bool
         Pas data-augmentatie toe (flips, rotaties).
     """
@@ -49,17 +58,23 @@ class DikeTileDataset(Dataset):
         tiles_dir: str | Path,
         labels_dir: str | Path,
         rgb_dir: str | Path | None = None,
+        dsm_dir: str | Path | None = None,
         tile_size: int = 256,
         include_slope: bool = True,
-        include_aspect: bool = False,
+        include_aspect: bool = True,
+        include_curvature: bool = True,
+        include_tpi: bool = True,
         augment: bool = False,
     ):
         self.tiles_dir = Path(tiles_dir)
         self.labels_dir = Path(labels_dir)
         self.rgb_dir = Path(rgb_dir) if rgb_dir else None
+        self.dsm_dir = Path(dsm_dir) if dsm_dir else None
         self.tile_size = tile_size
         self.include_slope = include_slope
         self.include_aspect = include_aspect
+        self.include_curvature = include_curvature
+        self.include_tpi = include_tpi
         self.augment = augment
 
         self.tile_files = sorted(self.tiles_dir.glob("*.tif"))
@@ -84,12 +99,29 @@ class DikeTileDataset(Dataset):
         # Vervang nodata
         dtm = np.nan_to_num(dtm, nan=0.0)
 
-        # Bouw input-kanalen
+        # Bouw input-kanalen: terrein-afgeleiden
         channels = [_normalize(dtm)]
         if self.include_slope:
             channels.append(_normalize(_compute_slope(dtm)))
         if self.include_aspect:
             channels.append(_normalize(_compute_aspect(dtm)))
+        if self.include_curvature:
+            channels.append(_normalize(_compute_curvature(dtm)))
+        if self.include_tpi:
+            channels.append(_normalize(_compute_tpi(dtm)))
+
+        # nDSM kanaal (DSM - DTM = vegetatie/objecthoogte)
+        h, w = dtm.shape
+        if self.dsm_dir is not None:
+            dsm_path = self.dsm_dir / tile_path.name
+            if dsm_path.exists():
+                with rasterio.open(dsm_path) as src:
+                    dsm = src.read(1).astype(np.float32)
+                dsm = np.nan_to_num(dsm, nan=0.0)
+                ndsm = np.clip(dsm - dtm, 0, 50)
+                channels.append(_normalize(ndsm))
+            else:
+                channels.append(np.zeros((h, w), dtype=np.float32))
 
         # Luchtfoto (RGB) kanalen
         if self.rgb_dir is not None:
@@ -100,8 +132,6 @@ class DikeTileDataset(Dataset):
                         band_data = src.read(band).astype(np.float32)
                         channels.append(_normalize(band_data))
             else:
-                # Pad with zeros to keep consistent channel count
-                h, w = dtm.shape
                 for _ in range(3):
                     channels.append(np.zeros((h, w), dtype=np.float32))
 
@@ -115,11 +145,17 @@ class DikeTileDataset(Dataset):
 
     @property
     def num_channels(self) -> int:
-        n = 1
+        n = 1  # DTM
         if self.include_slope:
             n += 1
         if self.include_aspect:
             n += 1
+        if self.include_curvature:
+            n += 1
+        if self.include_tpi:
+            n += 1
+        if self.dsm_dir is not None:
+            n += 1  # nDSM
         if self.rgb_dir is not None:
             n += 3  # R, G, B
         return n
@@ -146,6 +182,25 @@ def _compute_aspect(dtm: np.ndarray) -> np.ndarray:
     aspect = np.degrees(np.arctan2(-dy, dx))
     aspect[aspect < 0] += 360
     return aspect
+
+
+def _compute_curvature(dtm: np.ndarray) -> np.ndarray:
+    """Bereken curvature (2e afgeleide) — markeert knikpunten in het profiel."""
+    from scipy.ndimage import laplace
+    curv = laplace(dtm)
+    # Clip extreme waarden
+    p99 = np.percentile(np.abs(curv), 99)
+    return np.clip(curv, -p99, p99)
+
+
+def _compute_tpi(dtm: np.ndarray, radius: int = 15) -> np.ndarray:
+    """Bereken Topographic Position Index: hoogte t.o.v. omgeving.
+
+    Positieve waarden = hoger dan omgeving (kruin), negatief = lager (sloot).
+    """
+    from scipy.ndimage import uniform_filter
+    mean_elev = uniform_filter(dtm, size=radius)
+    return dtm - mean_elev
 
 
 def _augment(

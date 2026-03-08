@@ -83,6 +83,7 @@ def train_model(
     tiles_dir: str | Path,
     labels_dir: str | Path,
     rgb_dir: str | Path | None = None,
+    dsm_dir: str | Path | None = None,
     output_dir: str | Path = "models/checkpoints",
     epochs: int = 50,
     batch_size: int = 8,
@@ -109,7 +110,7 @@ def train_model(
 
     # Dataset
     dataset = DikeTileDataset(
-        tiles_dir, labels_dir, rgb_dir=rgb_dir,
+        tiles_dir, labels_dir, rgb_dir=rgb_dir, dsm_dir=dsm_dir,
         include_slope=include_slope, augment=True,
     )
     val_size = int(len(dataset) * val_split)

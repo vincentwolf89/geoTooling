@@ -174,17 +174,16 @@ def extract_lines(
 ) -> dict[str, LineString | None]:
     """Extraheer vector-lijnen uit een DL voorspellings-raster.
 
-    Extraheert:
-    - kruinlijn: middenlijn van de kruinzone (klasse 1)
-    - binnenkruinlijn: grens tussen kruin (1) en talud_binnen (2)
-    - buitenkruinlijn: grens tussen kruin (1) en talud_buiten (4)
-    - binnenteenlijn: grens tussen talud_binnen (2) en teen_binnen (3)
-    - buitenteenlijn: grens tussen talud_buiten (4) en teen_buiten (5)
+    Extraheert (indien aanwezig):
+    - kruinlijn, binnenkruinlijn, buitenkruinlijn
+    - binnenberm, buitenberm
+    - binnenteenlijn, buitenteenlijn
+    - insteeklijn, slootrand
 
     Parameters
     ----------
     prediction_path : str | Path
-        Pad naar het voorspellings-GeoTIFF (uint8 labels 0-5).
+        Pad naar het voorspellings-GeoTIFF (uint8 labels 0-9).
     output_gpkg : str | Path | None
         Optioneel pad om resultaten als GeoPackage op te slaan.
     simplify_tolerance : float
@@ -209,18 +208,49 @@ def extract_lines(
         labels, 1, transform, simplify_tolerance, smooth_sigma
     )
 
-    # Grenslijnen tussen zones
+    # Grenslijnen tussen zones (klasse-nummers conform nieuwe indeling)
+    # 1=kruin, 2=talud_binnen, 3=binnenberm, 4=teen_binnen,
+    # 5=talud_buiten, 6=buitenberm, 7=teen_buiten, 8=insteek, 9=sloot
     lines["binnenkruinlijn"] = _zone_edge_line(
         labels, 1, 2, transform, simplify_tolerance, smooth_sigma
     )
     lines["buitenkruinlijn"] = _zone_edge_line(
-        labels, 1, 4, transform, simplify_tolerance, smooth_sigma
+        labels, 1, 5, transform, simplify_tolerance, smooth_sigma
     )
+
+    # Bermlijnen (middenlijnen van bermzones)
+    lines["binnenberm"] = _class_centerline(
+        labels, 3, transform, simplify_tolerance, smooth_sigma
+    )
+    lines["buitenberm"] = _class_centerline(
+        labels, 6, transform, simplify_tolerance, smooth_sigma
+    )
+
+    # Teenlijnen
     lines["binnenteenlijn"] = _zone_edge_line(
-        labels, 2, 3, transform, simplify_tolerance, smooth_sigma
+        labels, 2, 4, transform, simplify_tolerance, smooth_sigma
     )
+    # Fallback: als er een berm is, zoek grens berm-teen
+    if lines["binnenteenlijn"] is None:
+        lines["binnenteenlijn"] = _zone_edge_line(
+            labels, 3, 4, transform, simplify_tolerance, smooth_sigma
+        )
     lines["buitenteenlijn"] = _zone_edge_line(
-        labels, 4, 5, transform, simplify_tolerance, smooth_sigma
+        labels, 5, 7, transform, simplify_tolerance, smooth_sigma
+    )
+    if lines["buitenteenlijn"] is None:
+        lines["buitenteenlijn"] = _zone_edge_line(
+            labels, 6, 7, transform, simplify_tolerance, smooth_sigma
+        )
+
+    # Insteeklijn
+    lines["insteeklijn"] = _class_centerline(
+        labels, 8, transform, simplify_tolerance, smooth_sigma
+    )
+
+    # Slootrand (grens water-land)
+    lines["slootrand"] = _zone_edge_line(
+        labels, 9, 0, transform, simplify_tolerance, smooth_sigma
     )
 
     # Samenvatting

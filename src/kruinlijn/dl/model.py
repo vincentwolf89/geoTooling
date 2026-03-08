@@ -1,4 +1,11 @@
-"""U-Net model met attention gates voor dijk-segmentatie."""
+"""U-Net model met attention gates, ASPP en SE-blokken voor dijk-segmentatie.
+
+Verbeteringen t.o.v. standaard U-Net:
+- Attention Gates: leert welke skip-connection features relevant zijn
+- ASPP (Atrous Spatial Pyramid Pooling): multi-scale context in bottleneck
+- Squeeze-Excitation (SE): channel attention per convolutieblok
+- Deep supervision: auxiliary losses van diepere decoder-lagen
+"""
 
 from __future__ import annotations
 
@@ -8,16 +15,16 @@ import torch.nn.functional as F
 
 
 def build_unet(
-    in_channels: int = 2,
-    num_classes: int = 6,
+    in_channels: int = 9,
+    num_classes: int = 10,
     base_features: int = 32,
 ) -> nn.Module:
-    """Bouw een U-Net met attention gates voor segmentatie van dijkonderdelen.
+    """Bouw een verbeterd U-Net voor segmentatie van dijkonderdelen.
 
     Parameters
     ----------
     in_channels : int
-        Aantal inputkanalen (bijv. 5 = DTM + slope + R + G + B).
+        Aantal inputkanalen (9 = DTM + slope + aspect + curvature + TPI + nDSM + R + G + B).
     num_classes : int
         Aantal outputklassen.
     base_features : int
@@ -26,23 +33,97 @@ def build_unet(
     return AttentionUNet(in_channels, num_classes, base_features)
 
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, dropout: float = 0.0):
+class SEBlock(nn.Module):
+    """Squeeze-Excitation block: leert per-kanaal gewichten."""
+
+    def __init__(self, channels: int, reduction: int = 4):
         super().__init__()
-        layers = [
+        mid = max(channels // reduction, 8)
+        self.squeeze = nn.AdaptiveAvgPool2d(1)
+        self.excitation = nn.Sequential(
+            nn.Linear(channels, mid, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, _, _ = x.shape
+        w = self.squeeze(x).view(b, c)
+        w = self.excitation(w).view(b, c, 1, 1)
+        return x * w
+
+
+class ConvBlock(nn.Module):
+    """Conv-BN-ReLU blok met optionele SE-attention en residual connection."""
+
+    def __init__(self, in_ch: int, out_ch: int, dropout: float = 0.0, use_se: bool = True):
+        super().__init__()
+        self.conv = nn.Sequential(
             nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
             nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
-        ]
-        if dropout > 0:
-            layers.append(nn.Dropout2d(dropout))
-        self.block = nn.Sequential(*layers)
+        )
+        self.se = SEBlock(out_ch) if use_se else nn.Identity()
+        self.dropout = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
+        # Residual shortcut (1x1 conv als kanalen verschillen)
+        self.shortcut = (
+            nn.Conv2d(in_ch, out_ch, 1, bias=False) if in_ch != out_ch else nn.Identity()
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
+        out = self.conv(x)
+        out = self.se(out)
+        out = self.dropout(out)
+        return out + self.shortcut(x)
+
+
+class ASPP(nn.Module):
+    """Atrous Spatial Pyramid Pooling — multi-scale feature extraction.
+
+    Vangt context op meerdere schalen: lokaal (3x3) tot breed (rate=12, 18).
+    Cruciaal voor het herkennen van brede structuren (talud, berm) en smalle (kruin, teen).
+    """
+
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.conv1x1 = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+        self.conv3x3_r6 = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=6, dilation=6, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+        self.conv3x3_r12 = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=12, dilation=12, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+        self.pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_ch, out_ch, 1, bias=True),
+            nn.ReLU(inplace=True),
+        )
+        self.project = nn.Sequential(
+            nn.Conv2d(out_ch * 4, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(0.2),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h, w = x.shape[2:]
+        feat1 = self.conv1x1(x)
+        feat2 = self.conv3x3_r6(x)
+        feat3 = self.conv3x3_r12(x)
+        feat4 = F.interpolate(self.pool(x), size=(h, w), mode="bilinear", align_corners=False)
+        return self.project(torch.cat([feat1, feat2, feat3, feat4], dim=1))
 
 
 class AttentionGate(nn.Module):
@@ -75,7 +156,7 @@ class AttentionGate(nn.Module):
 class AttentionUNet(nn.Module):
     def __init__(self, in_channels: int, num_classes: int, base: int = 32):
         super().__init__()
-        # Encoder
+        # Encoder met SE-blokken en residual connections
         self.enc1 = ConvBlock(in_channels, base)
         self.enc2 = ConvBlock(base, base * 2)
         self.enc3 = ConvBlock(base * 2, base * 4, dropout=0.1)
@@ -83,8 +164,9 @@ class AttentionUNet(nn.Module):
 
         self.pool = nn.MaxPool2d(2)
 
-        # Bottleneck
-        self.bottleneck = ConvBlock(base * 8, base * 16, dropout=0.3)
+        # Bottleneck met ASPP voor multi-scale context
+        self.bottleneck_conv = ConvBlock(base * 8, base * 16, dropout=0.3)
+        self.aspp = ASPP(base * 16, base * 16)
 
         # Decoder met attention gates
         self.up4 = nn.ConvTranspose2d(base * 16, base * 8, 2, stride=2)
@@ -116,8 +198,9 @@ class AttentionUNet(nn.Module):
         e3 = self.enc3(self.pool(e2))
         e4 = self.enc4(self.pool(e3))
 
-        # Bottleneck
-        b = self.bottleneck(self.pool(e4))
+        # Bottleneck + ASPP
+        b = self.bottleneck_conv(self.pool(e4))
+        b = self.aspp(b)
 
         # Decoder met attention
         u4 = self.up4(b)
@@ -139,7 +222,6 @@ class AttentionUNet(nn.Module):
         out = self.final(d1)
 
         if self.training:
-            # Deep supervision: return aux outputs voor extra loss
             aux3_out = F.interpolate(self.aux3(d3), size=x.shape[2:], mode="bilinear", align_corners=False)
             aux2_out = F.interpolate(self.aux2(d2), size=x.shape[2:], mode="bilinear", align_corners=False)
             return out, aux3_out, aux2_out
