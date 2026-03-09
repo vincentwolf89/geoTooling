@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \":*)",
+      "Bash(python examples/predict_area.py data/raw/zwo_sample_2km.geojson)",
+      "Bash(python examples/predict_area.py data/raw/zwo_sample_2km.geojson output/dl_combined/checkpoints/best_model.pt output/predict_zwo/)",
+      "Bash(ls -la data/raw/*.geojson)",
+      "Bash(PYTHONUNBUFFERED=1 python examples/train_combined.py --quick)",
+      "Bash(.venv/Scripts/python.exe examples/predict_area.py data/raw/zwo_sample_2km.geojson output/dl_combined/checkpoints/best_model.pt output/predict_zwo/)"
+    ]
+  }
+}

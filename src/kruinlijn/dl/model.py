@@ -1,10 +1,7 @@
-"""U-Net model met attention gates, ASPP en SE-blokken voor dijk-segmentatie.
+"""Segmentatiemodel voor dijk-classificatie.
 
-Verbeteringen t.o.v. standaard U-Net:
-- Attention Gates: leert welke skip-connection features relevant zijn
-- ASPP (Atrous Spatial Pyramid Pooling): multi-scale context in bottleneck
-- Squeeze-Excitation (SE): channel attention per convolutieblok
-- Deep supervision: auxiliary losses van diepere decoder-lagen
+Primair: segmentation_models_pytorch met pretrained ResNet34 encoder.
+Fallback: custom Attention U-Net met ASPP + SE-blokken.
 """
 
 from __future__ import annotations
@@ -18,8 +15,13 @@ def build_unet(
     in_channels: int = 9,
     num_classes: int = 10,
     base_features: int = 32,
+    encoder_name: str = "resnet34",
+    use_pretrained: bool = True,
 ) -> nn.Module:
-    """Bouw een verbeterd U-Net voor segmentatie van dijkonderdelen.
+    """Bouw een segmentatiemodel.
+
+    Probeert eerst smp.UnetPlusPlus met pretrained encoder.
+    Valt terug op custom AttentionUNet als smp niet beschikbaar is.
 
     Parameters
     ----------
@@ -28,10 +30,32 @@ def build_unet(
     num_classes : int
         Aantal outputklassen.
     base_features : int
-        Aantal features in de eerste laag (verdubbelt per encoder-blok).
+        Aantal features in de eerste laag (alleen voor fallback model).
+    encoder_name : str
+        Encoder backbone voor smp (bijv. 'resnet34', 'resnet50', 'efficientnet-b3').
+    use_pretrained : bool
+        Gebruik ImageNet pretrained weights voor encoder.
     """
-    return AttentionUNet(in_channels, num_classes, base_features)
+    try:
+        import segmentation_models_pytorch as smp
 
+        weights = "imagenet" if use_pretrained else None
+        model = smp.UnetPlusPlus(
+            encoder_name=encoder_name,
+            encoder_weights=weights,
+            in_channels=in_channels,
+            classes=num_classes,
+            decoder_attention_type="scse",  # Spatial + Channel SE attention
+        )
+        print(f"  Model: smp.UnetPlusPlus + {encoder_name} (pretrained={use_pretrained})")
+        return model
+
+    except ImportError:
+        print("  Model: custom AttentionUNet (smp niet beschikbaar)")
+        return AttentionUNet(in_channels, num_classes, base_features)
+
+
+# ---- Fallback: custom Attention U-Net ----
 
 class SEBlock(nn.Module):
     """Squeeze-Excitation block: leert per-kanaal gewichten."""
@@ -69,7 +93,6 @@ class ConvBlock(nn.Module):
         )
         self.se = SEBlock(out_ch) if use_se else nn.Identity()
         self.dropout = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
-        # Residual shortcut (1x1 conv als kanalen verschillen)
         self.shortcut = (
             nn.Conv2d(in_ch, out_ch, 1, bias=False) if in_ch != out_ch else nn.Identity()
         )
@@ -82,11 +105,7 @@ class ConvBlock(nn.Module):
 
 
 class ASPP(nn.Module):
-    """Atrous Spatial Pyramid Pooling — multi-scale feature extraction.
-
-    Vangt context op meerdere schalen: lokaal (3x3) tot breed (rate=12, 18).
-    Cruciaal voor het herkennen van brede structuren (talud, berm) en smalle (kruin, teen).
-    """
+    """Atrous Spatial Pyramid Pooling -- multi-scale feature extraction."""
 
     def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
@@ -156,7 +175,6 @@ class AttentionGate(nn.Module):
 class AttentionUNet(nn.Module):
     def __init__(self, in_channels: int, num_classes: int, base: int = 32):
         super().__init__()
-        # Encoder met SE-blokken en residual connections
         self.enc1 = ConvBlock(in_channels, base)
         self.enc2 = ConvBlock(base, base * 2)
         self.enc3 = ConvBlock(base * 2, base * 4, dropout=0.1)
@@ -164,11 +182,9 @@ class AttentionUNet(nn.Module):
 
         self.pool = nn.MaxPool2d(2)
 
-        # Bottleneck met ASPP voor multi-scale context
         self.bottleneck_conv = ConvBlock(base * 8, base * 16, dropout=0.3)
         self.aspp = ASPP(base * 16, base * 16)
 
-        # Decoder met attention gates
         self.up4 = nn.ConvTranspose2d(base * 16, base * 8, 2, stride=2)
         self.attn4 = AttentionGate(base * 8, base * 8, base * 4)
         self.dec4 = ConvBlock(base * 16, base * 8, dropout=0.2)
@@ -185,24 +201,20 @@ class AttentionUNet(nn.Module):
         self.attn1 = AttentionGate(base, base, base // 2)
         self.dec1 = ConvBlock(base * 2, base)
 
-        # Deep supervision: auxiliary outputs van diepere lagen
         self.aux3 = nn.Conv2d(base * 4, num_classes, 1)
         self.aux2 = nn.Conv2d(base * 2, num_classes, 1)
 
         self.final = nn.Conv2d(base, num_classes, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Encoder
         e1 = self.enc1(x)
         e2 = self.enc2(self.pool(e1))
         e3 = self.enc3(self.pool(e2))
         e4 = self.enc4(self.pool(e3))
 
-        # Bottleneck + ASPP
         b = self.bottleneck_conv(self.pool(e4))
         b = self.aspp(b)
 
-        # Decoder met attention
         u4 = self.up4(b)
         a4 = self.attn4(u4, e4)
         d4 = self.dec4(torch.cat([u4, a4], dim=1))

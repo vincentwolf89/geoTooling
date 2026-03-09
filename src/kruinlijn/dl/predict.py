@@ -122,6 +122,9 @@ def predict_tiles(
     # Post-processing: morfologische cleanup
     labels = _postprocess(labels)
 
+    # Correctie binnen/buiten oriëntatie op basis van DTM hoogte
+    labels = _correct_orientation(labels, dtm)
+
     # Schrijf output
     profile.update(dtype="uint8", count=1, nodata=0)
     with rasterio.open(output_path, "w", **profile) as dst:
@@ -235,3 +238,59 @@ def _postprocess(labels: np.ndarray, min_area: int = 200) -> np.ndarray:
             cleaned[(cleaned == 8) & ~outer_zone] = 0
 
     return cleaned
+
+
+def _correct_orientation(labels: np.ndarray, dtm: np.ndarray) -> np.ndarray:
+    """Corrigeer binnen/buiten oriëntatie op basis van DTM hoogte.
+
+    Strategie: vergelijk de gemiddelde DTM-hoogte van de 'binnen'-kant
+    (talud_binnen=2, teen_binnen=4, binnenberm=3) met de 'buiten'-kant
+    (talud_buiten=5, teen_buiten=7, buitenberm=6). De buitenzijde
+    (waterzijde) hoort lager te liggen. Als dat niet zo is, swap de klassen.
+
+    Parameters
+    ----------
+    labels : np.ndarray
+        Voorspelde klasselabels.
+    dtm : np.ndarray
+        DTM hoogtedata (zelfde shape als labels).
+
+    Returns
+    -------
+    np.ndarray
+        Gecorrigeerde labels.
+    """
+    binnen_mask = np.isin(labels, [2, 3, 4])  # talud_bi, berm_bi, teen_bi
+    buiten_mask = np.isin(labels, [5, 6, 7])  # talud_bu, berm_bu, teen_bu
+
+    # Alleen corrigeren als er voldoende pixels zijn van beide kanten
+    if binnen_mask.sum() < 100 or buiten_mask.sum() < 100:
+        return labels
+
+    # Gemiddelde DTM hoogte per zijde (excl. nodata en extreme waarden)
+    dtm_valid = dtm.copy().astype(np.float64)
+    dtm_valid[(dtm_valid == 0) | (dtm_valid < -10) | (dtm_valid > 100)] = np.nan
+
+    binnen_z = np.nanmean(dtm_valid[binnen_mask])
+    buiten_z = np.nanmean(dtm_valid[buiten_mask])
+
+    if np.isnan(binnen_z) or np.isnan(buiten_z):
+        return labels
+
+    # Buiten (waterkant) hoort lager te zijn dan binnen (polder)
+    # Als buiten hoger is dan binnen → swap
+    if buiten_z > binnen_z + 0.2:  # 0.2m marge
+        print(f"  Orientatie-correctie: buiten ({buiten_z:.1f}m) > binnen ({binnen_z:.1f}m) -> swap")
+        swap_map = {
+            2: 5, 5: 2,  # talud_binnen ↔ talud_buiten
+            3: 6, 6: 3,  # binnenberm ↔ buitenberm
+            4: 7, 7: 4,  # teen_binnen ↔ teen_buiten
+        }
+        corrected = labels.copy()
+        for old_cls, new_cls in swap_map.items():
+            corrected[labels == old_cls] = new_cls
+        return corrected
+    else:
+        print(f"  Orientatie OK: buiten ({buiten_z:.1f}m) <= binnen ({binnen_z:.1f}m)")
+
+    return labels

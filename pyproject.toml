@@ -12,6 +12,7 @@ dependencies = [
     "fiona>=1.9",
     "scikit-image>=0.21",
     "matplotlib>=3.7",
+    "requests>=2.28",
 ]
 
 [project.optional-dependencies]

@@ -33,10 +33,19 @@ from kruinlijn.data import (
     download_luchtfoto,
     download_bgt_waterdeel,
     load_hdsr_kniklijnen,
+    load_dtb_lines,
+    classify_dtb_sides,
 )
 
 # --- Configuratie ---
 HDSR_FILE = Path("data/raw/Kniklijnen HDSR.geojson")
+DTB_FILE = Path("data/raw/dtb_kruinlijnen_selectie.geojson")
+WSRL_FILES = {
+    "binnenkruin": Path("data/raw/Binnenkruinlijn (1).geojson"),
+    "buitenkruin": Path("data/raw/Buitenkruinlijn _Referentielijn (WSRL) (1).geojson"),
+    "binnenteen": Path("data/raw/Binnenteen Scope (1).geojson"),
+    "buitenteen": Path("data/raw/Buitenteen Scope (1).geojson"),
+}
 OUTPUT_DIR = Path("output/dl_combined")
 
 # Training parameters
@@ -45,6 +54,7 @@ TILE_OVERLAP = 64
 BUFFER_M = 60
 EPOCHS = 50
 MAX_DIJKEN = None  # None = alle dijken, of een getal om te limiten
+SKIP_EXISTING_SECTIONS = True  # Hergebruik al gedownloade secties
 
 
 def compute_dijk_sections(
@@ -229,7 +239,7 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
-    print("Training met gecombineerde datasets (HDSR + BGT)")
+    print("Training met gecombineerde datasets (HDSR + WSRL + DTB + BGT)")
     print("=" * 60)
 
     # 1. Laad HDSR kniklijnen
@@ -281,12 +291,80 @@ def main():
                 dijken[naam] = {k: [] for k in ref_lines.keys()}
             dijken[naam][target_key].append(line)
 
+    # 1b. Laad WSRL referentielijnen
+    wsrl_keys = ["binnenkruin", "buitenkruin", "binnenteen", "buitenteen"]
+    wsrl_loaded = False
+    for wsrl_key, wsrl_path in WSRL_FILES.items():
+        if not wsrl_path.exists():
+            print(f"  WSRL {wsrl_key}: bestand niet gevonden ({wsrl_path})")
+            continue
+
+        import geopandas as _gpd
+        wsrl_gdf = _gpd.read_file(wsrl_path)
+        if wsrl_gdf.crs and wsrl_gdf.crs.to_epsg() != 28992:
+            wsrl_gdf = wsrl_gdf.to_crs("EPSG:28992")
+
+        target_key = {
+            "binnenkruin": "binnenkruin",
+            "buitenkruin": "buitenkruin",
+            "binnenteen": "binnenteen",
+            "buitenteen": "buitenteen",
+        }[wsrl_key]
+
+        wsrl_lines = []
+        for _, row in wsrl_gdf.iterrows():
+            geom = row.geometry
+            if geom is None or geom.is_empty:
+                continue
+            parts = list(geom.geoms) if geom.geom_type == "MultiLineString" else [geom]
+            for part in parts:
+                if part.length > 5:
+                    wsrl_lines.append(part)
+
+        if wsrl_lines:
+            total_len = sum(l.length for l in wsrl_lines)
+            print(f"  WSRL {target_key}: {len(wsrl_lines)} lijnen, {total_len:.0f}m")
+
+            # Voeg toe aan dijken dict onder naam "WSRL"
+            if "WSRL" not in dijken:
+                dijken["WSRL"] = {k: [] for k in ref_lines.keys()}
+            dijken["WSRL"][target_key].extend(wsrl_lines)
+            wsrl_loaded = True
+
+    if wsrl_loaded:
+        print("  WSRL data toegevoegd aan trainingsset")
+
+    # 1c. Laad DTB referentielijnen
+    if DTB_FILE.exists():
+        print("\n[1c] Laden DTB lijnen...")
+        dtb_raw = load_dtb_lines(DTB_FILE)
+        dtb_classified = classify_dtb_sides(dtb_raw)
+
+        # Groepeer DTB lijnen per lokale cluster (gebruik x-range als proxy)
+        dtb_all_lines = []
+        for key, lines in dtb_classified.items():
+            dtb_all_lines.extend(lines)
+
+        if dtb_all_lines:
+            # Verdeel DTB in "dijken" op basis van ruimtelijke nabijheid
+            from shapely.ops import unary_union
+            from shapely.geometry import MultiLineString
+
+            # Simpele groepering: alles als 1 dijk (DTB data is al per traject)
+            dijken["DTB"] = {k: [] for k in ref_lines.keys()}
+            for key in ["binnenkruin", "buitenkruin", "binnenteen", "buitenteen"]:
+                if key in dtb_classified and dtb_classified[key]:
+                    dijken["DTB"][key] = dtb_classified[key]
+            print(f"  DTB data toegevoegd aan trainingsset")
+    else:
+        print(f"  DTB bestand niet gevonden: {DTB_FILE}")
+
     # Filter dijken met minimaal 2 types
     valid_dijken = {
         naam: lines for naam, lines in dijken.items()
         if sum(1 for v in lines.values() if v) >= 2
     }
-    print(f"\n  {len(valid_dijken)} dijken met >= 2 lijn-types")
+    print(f"\n  {len(valid_dijken)} dijken met >= 2 lijn-types (HDSR + WSRL + DTB)")
 
     if MAX_DIJKEN:
         # Sorteer op totale lengte, pak de langste
@@ -303,10 +381,11 @@ def main():
     rgb_tiles_dir = OUTPUT_DIR / "tiles" / "rgb"
     dsm_tiles_dir = OUTPUT_DIR / "tiles" / "dsm"
 
-    for d in [tiles_dir, labels_tiles_dir, rgb_tiles_dir, dsm_tiles_dir]:
-        if d.exists():
-            for f in d.glob("*.tif"):
-                f.unlink()
+    if not SKIP_EXISTING_SECTIONS:
+        for d in [tiles_dir, labels_tiles_dir, rgb_tiles_dir, dsm_tiles_dir]:
+            if d.exists():
+                for f in d.glob("*.tif"):
+                    f.unlink()
 
     total_tiles = 0
     section_id = 0
@@ -338,24 +417,43 @@ def main():
             rgb_path = section_dir / "luchtfoto.tif"
             labels_path = section_dir / "labels.tif"
 
-            # Download DTM
-            try:
-                px_w, px_h = download_ahn4_dtm(bbox, dtm_path)
-            except Exception as e:
-                print(f"    DTM FOUT: {e}")
+            # Check of sectie al verwerkt is (caching)
+            section_tiles = list(tiles_dir.glob(f"s{section_id:03d}_*.tif"))
+            if SKIP_EXISTING_SECTIONS and section_tiles and labels_path.exists():
+                n = len(section_tiles)
+                total_tiles += n
+                print(f"    Cache: {n} tiles hergebruikt")
                 continue
 
+            # Download DTM
+            if dtm_path.exists() and SKIP_EXISTING_SECTIONS:
+                with rasterio.open(dtm_path) as src:
+                    px_w, px_h = src.width, src.height
+                print(f"  DTM: {dtm_path.name} (cached)")
+            else:
+                try:
+                    px_w, px_h = download_ahn4_dtm(bbox, dtm_path)
+                except Exception as e:
+                    print(f"    DTM FOUT: {e}")
+                    continue
+
             # Download DSM
-            try:
-                download_ahn4_dsm(bbox, dsm_path)
-            except Exception as e:
-                dsm_path = None
+            if not (dsm_path.exists() and SKIP_EXISTING_SECTIONS):
+                try:
+                    download_ahn4_dsm(bbox, dsm_path)
+                except Exception as e:
+                    dsm_path = None
+            else:
+                print(f"  DSM: {dsm_path.name} (cached)")
 
             # Download luchtfoto
-            try:
-                download_luchtfoto(bbox, rgb_path, px_w, px_h)
-            except Exception as e:
-                rgb_path = None
+            if not (rgb_path.exists() and SKIP_EXISTING_SECTIONS):
+                try:
+                    download_luchtfoto(bbox, rgb_path, px_w, px_h)
+                except Exception as e:
+                    rgb_path = None
+            else:
+                print(f"  Luchtfoto: {rgb_path.name} (cached)")
 
             # Download BGT waterdelen
             try:
@@ -414,7 +512,7 @@ def main():
         return
 
     # Train model
-    print(f"\nTrainen Attention U-Net ({EPOCHS} epochs, HDSR + BGT)...")
+    print(f"\nTrainen Attention U-Net ({EPOCHS} epochs, HDSR + WSRL + DTB + BGT)...")
     try:
         from kruinlijn.dl.train import train_model
 
@@ -439,4 +537,40 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--quick" in sys.argv:
+        MAX_DIJKEN = 5
+        EPOCHS = 20
+        print(f"Quick mode: {MAX_DIJKEN} dijken, {EPOCHS} epochs")
+        main()
+    elif "--train-only" in sys.argv:
+        # Alleen training, skip data-generatie (gebruik bestaande tiles)
+        print("Training-only mode: hergebruik bestaande tiles")
+        tiles_dir = OUTPUT_DIR / "tiles" / "dtm"
+        labels_tiles_dir = OUTPUT_DIR / "tiles" / "labels"
+        rgb_tiles_dir = OUTPUT_DIR / "tiles" / "rgb"
+        dsm_tiles_dir = OUTPUT_DIR / "tiles" / "dsm"
+
+        n_tiles = len(list(tiles_dir.glob("*.tif"))) if tiles_dir.exists() else 0
+        print(f"  {n_tiles} tiles gevonden")
+
+        if n_tiles < 10:
+            print("Te weinig tiles. Draai eerst zonder --train-only.")
+            sys.exit(1)
+
+        from kruinlijn.dl.train import train_model
+        has_rgb = any(rgb_tiles_dir.glob("*.tif")) if rgb_tiles_dir.exists() else False
+        has_dsm = any(dsm_tiles_dir.glob("*.tif")) if dsm_tiles_dir.exists() else False
+
+        train_model(
+            tiles_dir=str(tiles_dir),
+            labels_dir=str(labels_tiles_dir),
+            rgb_dir=str(rgb_tiles_dir) if has_rgb else None,
+            dsm_dir=str(dsm_tiles_dir) if has_dsm else None,
+            output_dir=str(OUTPUT_DIR / "checkpoints"),
+            epochs=EPOCHS,
+            batch_size=4,
+            lr=1e-3,
+        )
+        print(f"\nKlaar! Output in: {OUTPUT_DIR.resolve()}")
+    else:
+        main()
