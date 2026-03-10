@@ -1,33 +1,35 @@
-# geoTooling — Dijksegmentatie via Deep Learning
+# geoTooling — Automatische kniklijnen-extractie uit AHN
 
-Automatische detectie van dijkonderdelen (kruinlijn, teenlijnen, taluds, bermen, insteek, sloot) op basis van AHN4 hoogte-data en luchtfoto's, met een Attention U-Net segmentatiemodel.
+Automatische detectie van dijkkniklijnen (kruinranden, teenlijnen) uit AHN4 DTM hoogte-data via dwarsprofiel-analyse. Produceert 4 continue lijnen per dijktraject: binnenkruinlijn, buitenkruinlijn, binnenteenlijn, buitenteenlijn.
 
-## Aanpak
+## Aanpak: Profiel-analyse
 
-1. **Referentielijnen als labels** — DTB-lijnen (RWS) of handmatig ingemeten lijnen worden samen met BGT waterdelen omgezet naar segmentatie-rasters
-2. **Multi-channel input** — 9 kanalen: DTM + slope + aspect + curvature + TPI + nDSM + R + G + B
-3. **Attention U-Net + ASPP + SE** — Segmentatiemodel met attention gates, atrous spatial pyramid pooling, en squeeze-excitation channel attention
-4. **Sliding window predict** — Voorspelling op willekeurig grote gebieden via overlappende tiles
-5. **Vectorisatie** — Pixel-classificatie wordt omgezet naar vectorlijnen (GeoPackage)
+1. **Dwarsprofielen** — Elke meter een loodrecht profiel (240m breed) op het AHN4 DTM
+2. **Knikpunt-detectie** — Kruinranden via krommingsanalyse (2e afgeleide), teenlijnen via helling-wandeling
+3. **Kwaliteitsfilter** — Slechte profielen (bebouwing, opritten) worden afgewezen op basis van prominentie, ruwheid en hoogtevariatie
+4. **AHN-snap** — Elk knikpunt wordt gesnapt naar het dichtstbijzijnde terrein-kenmerk op de DTM (3m zoekradius)
+5. **Smoothing** — Gaussian smoothing op XY-coordinaten voor vloeiende lijnen
+6. **Output** — GeoPackage met lijnen + raw knikpunten (incl. hoogte)
 
 ## Projectstructuur
 
 ```
 geoTooling/
 ├── src/kruinlijn/
-│   ├── data.py             # Data downloads (AHN4 DTM/DSM, luchtfoto, BGT, DTB)
+│   ├── profiel.py          # Knikpunt-detectie via dwarsprofiel-analyse
+│   ├── data.py             # Data downloads (AHN4 DTM/DSM, luchtfoto, BGT)
 │   ├── pipeline.py         # Label-generatie uit referentielijnen
-│   └── dl/
-│       ├── dataset.py      # PyTorch dataset (9 kanalen, augmentatie)
+│   └── dl/                 # Deep Learning aanpak (experimenteel)
 │       ├── model.py        # Attention U-Net + ASPP + SE blocks
-│       ├── train.py        # Training: Focal Loss + Dice Loss, deep supervision
-│       ├── predict.py      # Sliding window voorspelling + post-processing
+│       ├── train.py        # Training pipeline
+│       ├── predict.py      # Sliding window voorspelling
 │       └── vectorize.py    # Pixel → vectorlijnen
 ├── examples/
-│   ├── train_with_dtb.py         # Training met DTB referentielijnen
-│   ├── train_with_real_labels.py # Training met WSRL referentielijnen
-│   └── predict_area.py           # Voorspelling op nieuw dijkgebied
-├── data/raw/               # Referentielijnen, trajecten (niet in git)
+│   ├── run_profiel_zwo.py        # Volledige pipeline: 3 ZWO trajecten
+│   ├── test_profiel_v4.py        # Test op enkel traject + validatie
+│   ├── predict_area.py           # DL-voorspelling op nieuw dijkgebied
+│   └── train_wsrl.py             # DL-training met WSRL labels
+├── data/raw/               # Referentielijnen, trajecten, PVVR (niet in git)
 └── pyproject.toml
 ```
 
@@ -44,67 +46,52 @@ pip install -e ".[dl]"
 
 ## Gebruik
 
-### Training met DTB referentielijnen
+### Profiel-analyse op dijktrajecten (primaire aanpak)
 
 ```bash
-# Standaard: gebruikt data/raw/dtb_kruinlijnen_selectie.geojson
-python examples/train_with_dtb.py
+# Alle 3 ZWO trajecten (West Maas en Waal, Beuningen, Druten)
+python examples/run_profiel_zwo.py
 
-# Of met een eigen DTB-export:
-python examples/train_with_dtb.py data/raw/mijn_dtb.geojson
+# Enkel traject testen
+python examples/test_profiel_v4.py
 ```
 
-### Voorspelling op een nieuw gebied
+### Output
 
-```bash
-python examples/predict_area.py data/raw/traject.geojson [model.pt] [output_dir]
-```
+Per traject een GeoPackage met:
+- **Laag `lijnen`**: 4 kniklijnen (binnenkruin, buitenkruin, binnenteen, buitenteen)
+- **Laag `punten`**: ~10.000 raw knikpunten per lijn met hoogte
 
-### Klassen (10-klasse segmentatie)
+### Nauwkeurigheid (mediaan afstand tot WSRL PVVR referentie)
 
-| Label | Klasse         | Beschrijving                     |
-|-------|----------------|----------------------------------|
-| 0     | Achtergrond    | Geen dijk                        |
-| 1     | Kruin          | Kruinzone van de dijk            |
-| 2     | Talud binnen   | Binnenzijde (polder) talud       |
-| 3     | Binnenberm     | Berm aan polderzijde             |
-| 4     | Teen binnen    | Teen aan polderzijde             |
-| 5     | Talud buiten   | Buitenzijde (water) talud        |
-| 6     | Buitenberm     | Berm aan waterzijde              |
-| 7     | Teen buiten    | Teen aan waterzijde              |
-| 8     | Insteek        | Rand waterdeel (overgang sloot)   |
-| 9     | Sloot          | Wateroppervlak                   |
+| Lijn | Traject 1 | Traject 2 | Traject 3 |
+|------|-----------|-----------|-----------|
+| Binnenkruinlijn | 3.9m | 3.1m | 2.6m |
+| Buitenkruinlijn | 2.5m | 2.2m | 2.0m |
+| Binnenteenlijn | 7.6m | 13.9m | 7.4m |
+| Buitenteenlijn | 6.2m | 2.3m | 4.1m |
+
+## Algoritme details
+
+### Knikpunt-detectie per profiel
+
+- **Kruinrand**: Sterkste negatieve kromming (convexe knik) binnen 15m van kruintop
+- **Teenlijnen**: Wandel talud af vanaf kruinrand, zoek waar helling < 0.05 en hoogte < kruin - 1.5m
+  - Buitenzijde: eerste vlakke plek (geen bermen)
+  - Binnenzijde: laagste vlakke plek (passeert bermen)
+- **Buiten-kant detectie**: Gewogen stemming op taludsteilheid (2x) + hoogte ver weg
+
+### Validatie criteria per profiel
+
+- Minimaal 2m kruinbreedte
+- Minimaal 5m afstand kruin-teen
+- Minimaal 1.5m hoogteverschil kruin-teen
+- Correcte volgorde: buitenteen < buitenkruin < binnenkruin < binnenteen
 
 ## Data bronnen
 
 | Bron | Beschrijving | URL |
 |------|-------------|-----|
 | AHN4 DTM | Hoogtemodel (maaiveldhoogte, 50cm) | ArcGIS ImageServer |
-| AHN4 DSM | Oppervlaktemodel (incl. objecten) | ArcGIS ImageServer |
-| PDOK Luchtfoto | RGB luchtfoto | ArcGIS MapServer |
-| BGT Waterdeel | Sloten, waterlopen | PDOK OGC Features API |
-| DTB | Professioneel ingemeten dijklijnen (RWS) | WFS / GeoJSON export |
-
-## Model architectuur
-
-- **Backbone**: Attention U-Net (32 base features, 4 encoder blokken)
-- **Bottleneck**: ASPP (Atrous Spatial Pyramid Pooling) met dilations 6, 12 + global pooling
-- **Channel attention**: Squeeze-Excitation blocks per ConvBlock
-- **Residual connections**: 1x1 shortcut conv bij kanaalwijziging
-- **Deep supervision**: Auxiliary outputs op decoder level 2 en 3
-- **Loss**: Focal Loss (γ=2) + Dice Loss met automatische class weights
-- **~14.7M parameters**, 9 input kanalen, 10 output klassen
-
-## Input kanalen
-
-| # | Kanaal | Beschrijving |
-|---|--------|-------------|
-| 1 | DTM | Maaiveldhoogte (genormaliseerd) |
-| 2 | Slope | Helling (1e afgeleide) |
-| 3 | Aspect | Hellingsrichting |
-| 4 | Curvature | Kromming (Laplaciaan) |
-| 5 | TPI | Topographic Position Index (hoogte t.o.v. omgeving) |
-| 6 | nDSM | DSM - DTM (vegetatie/objecthoogte) |
-| 7 | R | Rood kanaal luchtfoto |
-| 8 | G | Groen kanaal luchtfoto |
-| 9 | B | Blauw kanaal luchtfoto |
+| WSRL PVVR | Referentielijnen waterschap | portal.wsrl.nl |
+| DTB | Professioneel ingemeten dijklijnen (RWS) | GeoJSON export |
