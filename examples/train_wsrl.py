@@ -39,7 +39,7 @@ OUTPUT_DIR = Path("output/dl_wsrl")
 TILE_SIZE = 256
 TILE_OVERLAP = 64
 BUFFER_M = 60
-EPOCHS = 70
+EPOCHS = 100
 MAX_DIJKEN = None
 SKIP_EXISTING_SECTIONS = True
 
@@ -381,6 +381,14 @@ def main():
         has_rgb = any(rgb_tiles_dir.glob("*.tif")) if rgb_tiles_dir.exists() else False
         has_dsm = any(dsm_tiles_dir.glob("*.tif")) if dsm_tiles_dir.exists() else False
 
+        # Fine-tune vanaf bestaand model als --finetune flag
+        finetune_path = None
+        if "--finetune" in sys.argv:
+            best = OUTPUT_DIR / "checkpoints" / "best_model.pt"
+            if best.exists():
+                finetune_path = str(best)
+                print(f"  Fine-tunen vanaf: {finetune_path}")
+
         train_model(
             tiles_dir=str(tiles_dir),
             labels_dir=str(labels_tiles_dir),
@@ -389,7 +397,8 @@ def main():
             output_dir=str(OUTPUT_DIR / "checkpoints"),
             epochs=EPOCHS,
             batch_size=4,
-            lr=1e-3,
+            lr=3e-4 if finetune_path else 1e-3,
+            pretrained_path=finetune_path,
         )
     except ImportError:
         print("PyTorch niet geinstalleerd. pip install -e '.[dl]'")

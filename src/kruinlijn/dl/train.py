@@ -91,6 +91,7 @@ def train_model(
     val_split: float = 0.2,
     include_slope: bool = True,
     device: str | None = None,
+    pretrained_path: str | Path | None = None,
 ) -> nn.Module:
     """Train het Attention U-Net segmentatiemodel.
 
@@ -122,6 +123,10 @@ def train_model(
 
     # Model
     model = build_unet(in_channels=dataset.num_channels, num_classes=NUM_CLASSES)
+    if pretrained_path is not None:
+        state = torch.load(pretrained_path, map_location=device)
+        model.load_state_dict(state)
+        print(f"  Fine-tunen vanaf: {pretrained_path}")
     model = model.to(device)
 
     # Automatische class weights

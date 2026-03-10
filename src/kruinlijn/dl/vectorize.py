@@ -100,14 +100,15 @@ def _mask_boundary_line(
     if merged.geom_type == "LineString":
         return merged
     elif merged.geom_type == "MultiLineString":
-        # Probeer nabije lijnen te verbinden (binnen 20m)
-        connected = _connect_nearby_lines(list(merged.geoms), max_gap=20.0)
+        # Probeer nabije lijnen te verbinden (binnen 50m)
+        connected = _connect_nearby_lines(list(merged.geoms), max_gap=50.0)
         if connected.geom_type == "LineString":
             return connected
-        # Neem de langste als verbinden niet lukt
-        return max(connected.geoms, key=lambda g: g.length)
+        # Bewaar alle significante fragmenten als MultiLineString
+        return connected
 
-    return max(all_lines, key=lambda g: g.length)
+    # Bewaar alle lijnen als MultiLineString
+    return MultiLineString(all_lines)
 
 
 def _zone_edge_line(
@@ -272,11 +273,6 @@ def extract_lines(
 
     lines = {}
 
-    # Kruinlijn: middenlijn van de kruinzone
-    lines["kruinlijn"] = _class_centerline(
-        labels, 1, transform, simplify_tolerance, smooth_sigma
-    )
-
     # Klassen: 1=kruin, 2=talud_binnen, 3=binnenberm, 4=teen_binnen,
     #          5=talud_buiten, 6=buitenberm, 7=teen_buiten, 8=insteek, 9=sloot
 
@@ -302,14 +298,6 @@ def extract_lines(
         edge_m([1], [5, 6, 7])
     )
 
-    # Bermlijnen (middenlijnen van bermzones)
-    lines["binnenberm"] = _class_centerline(
-        labels, 3, transform, simplify_tolerance, smooth_sigma
-    )
-    lines["buitenberm"] = _class_centerline(
-        labels, 6, transform, simplify_tolerance, smooth_sigma
-    )
-
     # Binnenteenlijn: talud_binnen-teen → berm-teen → teen-achtergrond/insteek
     # → uiterste fallback: buitenrand van gehele binnenzone
     lines["binnenteenlijn"] = (
@@ -330,20 +318,12 @@ def extract_lines(
         edge_m([5, 6, 7], [0, 8, 9])
     )
 
-    # Insteeklijn
-    lines["insteeklijn"] = _class_centerline(
-        labels, 8, transform, simplify_tolerance, smooth_sigma
-    )
-
-    # Slootrand (grens water-land)
-    lines["slootrand"] = _zone_edge_line(
-        labels, 9, 0, transform, simplify_tolerance, smooth_sigma
-    )
-
     # Samenvatting
     for name, line in lines.items():
         if line is not None:
-            print(f"  {name}: {line.length:.0f}m ({len(line.coords)} punten)")
+            n_parts = len(line.geoms) if line.geom_type == "MultiLineString" else 1
+            suffix = f" ({n_parts} delen)" if n_parts > 1 else ""
+            print(f"  {name}: {line.length:.0f}m{suffix}")
         else:
             print(f"  {name}: niet gevonden")
 

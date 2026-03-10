@@ -71,7 +71,7 @@ def predict_traject(
     traject: LineString,
     model_path: Path,
     output_dir: Path,
-    section_length: float = 3000,
+    section_length: float = 1000,
     section_overlap: float = 200,
 ) -> list[Path]:
     """Voorspel een heel traject in secties.

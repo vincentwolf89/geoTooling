@@ -49,7 +49,6 @@ LINE_COLORS = {
     "buitenkruin": "#c0392b",    # donkerrood
     "binnenteen":  "#1abc9c",    # teal
     "buitenteen":  "#e67e22",    # oranje
-    "kruinlijn":   "#e74c3c",    # rood (fallback voor losse kruinlijn)
     "insteek":     "#9b59b6",    # paars
     "sloot":       "#34495e",    # donkergrijs
     "binnenberm":  "#2ecc71",    # groen
