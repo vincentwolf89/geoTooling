@@ -623,7 +623,6 @@ def extract_kniklijnen(
 
         coords = list(zip(x_final, y_final))
         line = LineString(coords)
-        line = line.simplify(2.0, preserve_topology=True)
         lines[name + "lijn"] = line
         print(f"  {name}lijn: {line.length:.0f}m ({good.sum()} punten)")
 

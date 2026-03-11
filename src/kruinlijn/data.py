@@ -535,6 +535,198 @@ def classify_dtb_sides(
     }
 
 
+def _ahn4_subtiles_for_bbox(bbox: tuple) -> list[tuple[str, str]]:
+    """Bepaal welke AHN4 LAZ subtiles een bbox dekken.
+
+    Returns lijst van (tile_name, download_url) tuples.
+    """
+    import json
+    import urllib.request
+
+    # Haal kaartbladindex op van PDOK
+    idx_url = "https://service.pdok.nl/rws/ahn/atom/downloads/dtm_05m/kaartbladindex.json"
+    req = urllib.request.Request(idx_url, headers={"User-Agent": "geoTooling/1.0"})
+    resp = urllib.request.urlopen(req, timeout=30)
+    data = json.loads(resp.read())
+
+    from shapely.geometry import shape as shp_shape
+
+    target = box(*bbox)
+    results = []
+
+    for feat in data["features"]:
+        geom = shp_shape(feat["geometry"])
+        if not geom.intersects(target):
+            continue
+
+        blad_nr = feat["properties"]["kaartbladNr"]  # e.g. "M_39GN1"
+        # Haal blad-code uit: M_39GN1 -> 39GN1
+        blad = blad_nr.replace("M_", "")
+        blad_bounds = geom.bounds
+
+        # Bereken welke subtiles (1x1.25km) nodig zijn
+        bx_min, by_min, bx_max, by_max = blad_bounds
+        dx = (bx_max - bx_min) / 5   # 1000m
+        dy = (by_max - by_min) / 5    # 1250m
+
+        for row in range(5):
+            for col in range(5):
+                st_x_min = bx_min + col * dx
+                st_x_max = st_x_min + dx
+                st_y_max = by_max - row * dy
+                st_y_min = st_y_max - dy
+
+                st_box = box(st_x_min, st_y_min, st_x_max, st_y_max)
+                # Subtiles hebben 25m overlap, dus iets ruimer testen
+                if st_box.buffer(30).intersects(target):
+                    subtile_nr = row * 5 + col + 1
+                    name = f"{blad}_{subtile_nr:02d}"
+                    url = f"https://geotiles.citg.tudelft.nl/AHN4_T/{name}.LAZ"
+                    results.append((name, url))
+
+    return results
+
+
+def download_ahn4_pointcloud_dtm(
+    bbox: tuple,
+    output_path: Path,
+    resolution: float = 0.5,
+    cache_dir: Path | None = None,
+    classes: list[int] | None = None,
+) -> tuple[int, int]:
+    """Download AHN4 puntenwolk en maak DTM uit grondpunten.
+
+    Parameters
+    ----------
+    bbox : tuple
+        (minx, miny, maxx, maxy) in EPSG:28992.
+    output_path : Path
+        Uitvoerpad voor het GeoTIFF.
+    resolution : float
+        Pixelgrootte in meters (default 0.5m).
+    cache_dir : Path | None
+        Map om LAZ bestanden te cachen. None = data/pointcloud.
+    classes : list[int] | None
+        LAS classificaties. None = [2] (alleen grond).
+        AHN4: 2=ground, 6=building, 1=unclassified
+
+    Returns
+    -------
+    tuple[int, int]
+        (breedte_px, hoogte_px)
+    """
+    import urllib.request
+
+    import laspy
+    from scipy.interpolate import griddata
+
+    if classes is None:
+        classes = [2]  # Alleen grondpunten
+
+    if cache_dir is None:
+        cache_dir = Path("data/pointcloud")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    minx, miny, maxx, maxy = bbox
+
+    # Bepaal welke subtiles nodig zijn
+    subtiles = _ahn4_subtiles_for_bbox(bbox)
+    if not subtiles:
+        raise RuntimeError(f"Geen AHN4 puntenwolk-tiles gevonden voor bbox {bbox}")
+
+    print(f"  Puntenwolk: {len(subtiles)} subtile(s) nodig")
+
+    # Download en verzamel grondpunten
+    all_x, all_y, all_z = [], [], []
+    for name, url in subtiles:
+        laz_path = cache_dir / f"{name}.LAZ"
+        if not laz_path.exists():
+            print(f"    Downloaden {name}.LAZ ...")
+            req = urllib.request.Request(url, headers={"User-Agent": "geoTooling/1.0"})
+            resp = urllib.request.urlopen(req, timeout=600)
+            laz_path.write_bytes(resp.read())
+            size_mb = laz_path.stat().st_size / 1024 / 1024
+            print(f"    {name}.LAZ: {size_mb:.0f} MB")
+        else:
+            size_mb = laz_path.stat().st_size / 1024 / 1024
+            print(f"    {name}.LAZ: cached ({size_mb:.0f} MB)")
+
+        # Lees en filter
+        las = laspy.read(str(laz_path))
+        mask = np.isin(las.classification, classes)
+        x = np.array(las.x[mask])
+        y = np.array(las.y[mask])
+        z = np.array(las.z[mask])
+
+        # Clip op bbox
+        clip = (x >= minx) & (x <= maxx) & (y >= miny) & (y <= maxy)
+        all_x.append(x[clip])
+        all_y.append(y[clip])
+        all_z.append(z[clip])
+
+    x = np.concatenate(all_x)
+    y = np.concatenate(all_y)
+    z = np.concatenate(all_z)
+    print(f"  {len(x):,} grondpunten in bbox")
+
+    if len(x) < 100:
+        raise RuntimeError(f"Te weinig punten ({len(x)}) in bbox")
+
+    # Interpoleer naar grid
+    cols = int(np.ceil((maxx - minx) / resolution))
+    rows = int(np.ceil((maxy - miny) / resolution))
+
+    xi = np.linspace(minx + resolution / 2, maxx - resolution / 2, cols)
+    yi = np.linspace(maxy - resolution / 2, miny + resolution / 2, rows)
+    xi_grid, yi_grid = np.meshgrid(xi, yi)
+
+    grid = griddata((x, y), z, (xi_grid, yi_grid), method="linear", fill_value=np.nan)
+
+    # Vul kleine gaten met nearest-neighbor
+    nan_mask = np.isnan(grid)
+    if nan_mask.any():
+        grid_nn = griddata(
+            (x, y), z,
+            (xi_grid[nan_mask], yi_grid[nan_mask]),
+            method="nearest",
+        )
+        grid[nan_mask] = grid_nn
+
+    grid = grid.astype(np.float32)
+
+    # Schrijf als GeoTIFF
+    transform = from_bounds(minx, miny, maxx, maxy, cols, rows)
+    with rasterio.open(
+        output_path, "w", driver="GTiff",
+        height=rows, width=cols, count=1, dtype="float32",
+        crs="EPSG:28992", transform=transform, compress="deflate",
+    ) as dst:
+        dst.write(grid, 1)
+
+    print(f"  PC-DTM: {output_path.name} ({cols}x{rows}, {resolution}m)")
+    return cols, rows
+
+
+def download_ahn4_pointcloud_dsm(
+    bbox: tuple,
+    output_path: Path,
+    resolution: float = 0.5,
+    cache_dir: Path | None = None,
+) -> tuple[int, int]:
+    """Download AHN4 puntenwolk en maak DSM (alle punten behalve water).
+
+    Identiek aan download_ahn4_pointcloud_dtm maar met klassen 1+2+6
+    (unclassified + ground + building).
+    """
+    return download_ahn4_pointcloud_dtm(
+        bbox, output_path, resolution, cache_dir,
+        classes=[1, 2, 6],  # Alles behalve water (9)
+    )
+
+
 def load_hdsr_kniklijnen(
     geojson_path: str | Path,
     bbox: tuple | None = None,
