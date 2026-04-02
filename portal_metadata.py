@@ -31,7 +31,7 @@ PORTAL_URL = "https://portal.wsrl.nl/portal"
 # Standaard metadata (wordt op ALLE items gezet)
 DEFAULT_TAGS = ["wsrl", "waterveiligheid", "dijkversterking"]
 DEFAULT_CATEGORIES = ["/Categories/omgeving"]
-DEFAULT_CREDITS = "Openbare data dijkversterkingsprojecten, gepubliceerd door v.wolf@wsrl.nl"
+DEFAULT_CREDITS = "Werkdata dijkversterkingsprojecten, gepubliceerd door v.wolf@wsrl.nl"
 DEFAULT_LICENSE = "Werkdata, hier kunnen geen rechten aan worden ontleend."
 
 # Template voor automatische beschrijving als er geen beschrijving is
@@ -117,7 +117,9 @@ def update_items(gis, dry_run=False, skip_existing=False, scope="public", auto=F
     for idx, item in enumerate(items, 1):
         print(f"\n[{idx}/{len(items)}] {item.title}")
         print(f"  Type: {item.type}")
+        print(f"  Toegang: {item.access}")
         print(f"  URL:  {item.url or item.homepage or '-'}")
+        print(f"  Credits: {item.accessInformation or '(leeg)'}")
 
         # Huidige beschrijving tonen
         current_desc = item.description or ""
@@ -185,8 +187,10 @@ def update_items(gis, dry_run=False, skip_existing=False, scope="public", auto=F
             continue
 
         # Toepassen
+        print(f"  -> Verstuur: {updates}")
         try:
-            item.update(item_properties=updates)
+            result = item.update(item_properties=updates)
+            print(f"  -> Update result: {result}")
 
             # Categorieën apart (kan falen als categorie-schema niet bestaat)
             try:
