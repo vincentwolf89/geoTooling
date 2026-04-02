@@ -1,17 +1,20 @@
 """
 ArcGIS Portal / AGOL metadata bijwerken.
 
-Haalt alle openbare items op, stelt standaard metadata in (tags,
-categorieën, credits, gebruiksvoorwaarden) en vraagt per item om
-een beschrijving.
+Haalt items op, stelt standaard metadata in (tags, categorieën,
+credits, gebruiksvoorwaarden) en vraagt per item om een beschrijving.
 
 Gebruik:
-    python portal_metadata.py                # Alle items bijwerken
-    python portal_metadata.py --dry-run      # Preview zonder wijzigingen
+    python portal_metadata.py                  # Alleen openbare items
+    python portal_metadata.py --private        # Alleen niet-openbare items
+    python portal_metadata.py --all            # Alle items
+    python portal_metadata.py --auto           # Automatisch beschrijving invullen (geen input)
+    python portal_metadata.py --dry-run        # Preview zonder wijzigingen
     python portal_metadata.py --skip-existing  # Sla items over die al een beschrijving hebben
 
 PowerShell (ArcGIS Pro Python):
     & "C:/Program Files/ArcGIS/Pro/bin/Python/envs/arcgispro-py3/python.exe" portal_metadata.py --dry-run
+    & "C:/Program Files/ArcGIS/Pro/bin/Python/envs/arcgispro-py3/python.exe" portal_metadata.py --private --auto
 """
 
 import re
@@ -56,19 +59,31 @@ def connect_to_portal():
 # ITEMS OPHALEN
 # ==============================================================================
 
-def fetch_public_items(gis):
-    """Haal alle openbare items op van de ingelogde gebruiker."""
+def fetch_items(gis, scope="public"):
+    """Haal items op van de ingelogde gebruiker.
+
+    Args:
+        scope: "public" (alleen openbaar), "private" (alleen niet-openbaar),
+               of "all" (alles).
+    """
     user = gis.users.me
     username = user.username
-    print(f"\nOpenbare items zoeken voor: {username}")
+    scope_label = {"public": "openbare", "private": "niet-openbare", "all": "alle"}[scope]
+    print(f"\n{scope_label.capitalize()} items zoeken voor: {username}")
+
+    query = f"owner:{username}"
+    if scope == "public":
+        query += " access:public"
+    elif scope == "private":
+        query += " -access:public"
 
     # Search query is sneller dan user.items() op enterprise portals
     items = gis.content.search(
-        query=f"owner:{username} access:public",
+        query=query,
         max_items=10000,
     )
 
-    print(f"{len(items)} openbare items gevonden")
+    print(f"{len(items)} {scope_label} items gevonden")
     return items
 
 
@@ -76,12 +91,12 @@ def fetch_public_items(gis):
 # METADATA BIJWERKEN
 # ==============================================================================
 
-def update_items(gis, dry_run=False, skip_existing=False):
-    """Loop door alle openbare items en werk metadata bij."""
-    items = fetch_public_items(gis)
+def update_items(gis, dry_run=False, skip_existing=False, scope="public", auto=False):
+    """Loop door items en werk metadata bij."""
+    items = fetch_items(gis, scope=scope)
 
     if not items:
-        print("Geen openbare items gevonden.")
+        print("Geen items gevonden.")
         return
 
     if dry_run:
@@ -125,25 +140,29 @@ def update_items(gis, dry_run=False, skip_existing=False):
             )
             print(f"  Voorstel: {suggestion}")
 
-        # Vraag om beschrijving
-        print()
-        try:
-            if suggestion:
-                description = input("  Beschrijving (Enter = voorstel accepteren, 's' = overslaan): ").strip()
-            else:
-                description = input("  Beschrijving (Enter = behouden, 's' = overslaan): ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print("\n\nAfgebroken door gebruiker.")
-            break
-
-        if description.lower() == "s":
-            print("  -> Overgeslagen")
-            skipped += 1
-            continue
-
-        # Gebruik voorstel als gebruiker Enter drukt en er een voorstel is
-        if not description and suggestion:
+        # Beschrijving bepalen
+        if auto:
+            # Automatisch: gebruik voorstel of behoud bestaande
             description = suggestion
+        else:
+            print()
+            try:
+                if suggestion:
+                    description = input("  Beschrijving (Enter = voorstel accepteren, 's' = overslaan): ").strip()
+                else:
+                    description = input("  Beschrijving (Enter = behouden, 's' = overslaan): ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\n\nAfgebroken door gebruiker.")
+                break
+
+            if description.lower() == "s":
+                print("  -> Overgeslagen")
+                skipped += 1
+                continue
+
+            # Gebruik voorstel als gebruiker Enter drukt en er een voorstel is
+            if not description and suggestion:
+                description = suggestion
 
         # Bouw update properties
         updates = {
@@ -210,8 +229,17 @@ def main():
     dry_run = "--dry-run" in sys.argv
     skip_existing = "--skip-existing" in sys.argv
 
+    if "--all" in sys.argv:
+        scope = "all"
+    elif "--private" in sys.argv:
+        scope = "private"
+    else:
+        scope = "public"
+
+    auto = "--auto" in sys.argv
+
     gis = connect_to_portal()
-    update_items(gis, dry_run=dry_run, skip_existing=skip_existing)
+    update_items(gis, dry_run=dry_run, skip_existing=skip_existing, scope=scope, auto=auto)
 
 
 if __name__ == "__main__":
